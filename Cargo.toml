@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/discord-purge",
+  "crates/discord-purge-core",
+  "crates/discord-purge-tui",
+  "crates/discord-purge-web",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/racetozero/discord-purge"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+csv = "1"
+dirs = "5"
+discord-purge-core = { path = "crates/discord-purge-core", version = "0.0.1" }
+discord-purge-tui = { path = "crates/discord-purge-tui", version = "0.0.1" }
+discord-purge-web = { path = "crates/discord-purge-web", version = "0.0.1" }
+futures = "0.3"
+iana-time-zone = "0.1"
+open = "5"
+rand = "0.8"
+ratatui = "0.29"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "deflate", "gzip", "http3", "json", "rustls-tls", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.44", features = ["full"] }
+zip = "2"
+
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"

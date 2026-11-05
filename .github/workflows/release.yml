@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, target: aarch64-apple-darwin, pgo: true}
+          - {os: macos-15-intel, target: x86_64-apple-darwin, pgo: true}
+          - {os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, pgo: true}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, pgo: true}
+          - {os: ubuntu-24.04, target: x86_64-unknown-linux-musl, pgo: true}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, pgo: true}
+          - {os: windows-2025, target: x86_64-pc-windows-msvc, pgo: true}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, pgo: false}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          workspaces: '. -> target/pgo'
+      - name: Install musl compiler
+        if: contains(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build, train, rebuild, verify, and package
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_PGO: ${{ matrix.pgo }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          args=(--target "$RELEASE_TARGET")
+          if [ "$RELEASE_PGO" = false ]; then args+=(--no-pgo); fi
+          if [ -n "$RELEASE_TAG" ]; then args+=(--tag "$RELEASE_TAG"); fi
+          python scripts/build_release.py "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: target/distrib/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish only after every target succeeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes artifacts/*

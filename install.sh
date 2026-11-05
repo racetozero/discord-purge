@@ -1,0 +1,292 @@
+#!/bin/sh
+set -eu
+
+REPOSITORY="${DISCORD_PURGE_REPOSITORY:-racetozero/discord-purge}"
+RELEASES_URL="${DISCORD_PURGE_RELEASES_URL:-https://github.com/$REPOSITORY/releases}"
+
+say() {
+    printf '%s\n' "$*" >&2
+}
+
+fail() {
+    say "discord-purge installer: $*"
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+github_cli_ready() {
+    [ -z "${DISCORD_PURGE_RELEASES_URL:-}" ] &&
+        command_exists gh &&
+        gh auth status --hostname github.com >/dev/null 2>&1
+}
+
+normalize_tag() {
+    requested="$1"
+    case "$requested" in
+        v*) tag="$requested" ;;
+        *) tag="v$requested" ;;
+    esac
+    version="${tag#v}"
+    case "$version" in
+        '' | *[!0-9A-Za-z.+-]*) fail "DISCORD_PURGE_VERSION is '$requested'. Use latest or a release version such as 0.1.0 or v0.1.0" ;;
+    esac
+}
+
+resolve_tag() {
+    requested="${DISCORD_PURGE_VERSION:-}"
+    if [ -n "$requested" ] && [ "$requested" != "latest" ]; then
+        normalize_tag "$requested"
+        return
+    fi
+
+    if github_cli_ready; then
+        resolved="$(gh release view --repo "$REPOSITORY" --json tagName --jq .tagName)" ||
+            fail "could not find the latest release with gh"
+        [ -n "$resolved" ] || fail "the latest release has no tag"
+        normalize_tag "$resolved"
+        return
+    fi
+
+    [ -z "${DISCORD_PURGE_RELEASES_URL:-}" ] ||
+        fail "set DISCORD_PURGE_VERSION when DISCORD_PURGE_RELEASES_URL is set"
+    command_exists curl ||
+        fail "curl or an authenticated gh command is required to find the latest release"
+    final_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' "$RELEASES_URL/latest")" ||
+        fail "could not find the latest release. For a private repository, run 'gh auth login' and retry"
+    resolved="${final_url%/}"
+    resolved="${resolved##*/}"
+    [ -n "$resolved" ] || fail "the latest release URL has no tag"
+    normalize_tag "$resolved"
+}
+
+detect_target() {
+    if [ -n "${DISCORD_PURGE_TARGET:-}" ]; then
+        target="$DISCORD_PURGE_TARGET"
+    else
+        os="$(uname -s)" || fail "could not detect the operating system"
+        machine="$(uname -m)" || fail "could not detect the processor"
+        case "$machine" in
+            arm64 | aarch64) architecture="aarch64" ;;
+            x86_64 | amd64) architecture="x86_64" ;;
+            *) fail "this processor ($machine) is unsupported. Use an arm64/aarch64 or x86_64 system" ;;
+        esac
+
+        case "$os" in
+            Darwin)
+                target="$architecture-apple-darwin"
+                ;;
+            Linux)
+                libc="${DISCORD_PURGE_LIBC:-}"
+                if [ -z "$libc" ]; then
+                    if command_exists getconf && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+                        libc="gnu"
+                    elif command_exists ldd && ldd --version 2>&1 | grep -qi musl; then
+                        libc="musl"
+                    else
+                        libc="gnu"
+                    fi
+                fi
+                case "$libc" in
+                    gnu | musl) ;;
+                    *) fail "DISCORD_PURGE_LIBC is '$libc'. Set it to gnu or musl, or unset it to detect the C library" ;;
+                esac
+                target="$architecture-unknown-linux-$libc"
+                ;;
+            *) fail "this operating system ($os) is unsupported by install.sh. Use macOS or Linux, or install.ps1 on Windows" ;;
+        esac
+    fi
+
+    case "$target" in
+        aarch64-apple-darwin | x86_64-apple-darwin | aarch64-unknown-linux-gnu | aarch64-unknown-linux-musl | x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl) ;;
+        *) fail "DISCORD_PURGE_TARGET is $target. Use an apple-darwin or unknown-linux-gnu/musl target for aarch64 or x86_64, or unset it to detect the system. Windows uses install.ps1" ;;
+    esac
+}
+
+download_file() {
+    source_url="$1"
+    destination="$2"
+    case "$source_url" in
+        file://*)
+            cp "${source_url#file://}" "$destination"
+            ;;
+        https://*)
+            if command_exists curl; then
+                curl --proto '=https' --tlsv1.2 -fsSL "$source_url" -o "$destination"
+            elif command_exists wget; then
+                wget --https-only --secure-protocol=TLSv1_2 -q "$source_url" -O "$destination"
+            else
+                fail "curl or wget is required to download release files"
+            fi
+            ;;
+        *) fail "the release URL $source_url is not https or file. Set DISCORD_PURGE_RELEASES_URL to an https:// or file:// URL" ;;
+    esac
+}
+
+download_release() {
+    if github_cli_ready; then
+        gh release download "$tag" \
+            --repo "$REPOSITORY" \
+            --pattern "$archive_name" \
+            --pattern "$checksum_name" \
+            --dir "$temporary_directory" \
+            --clobber >/dev/null || fail "could not download $tag with gh"
+        return
+    fi
+
+    asset_base="$RELEASES_URL/download/$tag"
+    download_file "$asset_base/$archive_name" "$temporary_directory/$archive_name" ||
+        fail "could not download $archive_name from $asset_base. For a private repository, run 'gh auth login' and retry"
+    download_file "$asset_base/$checksum_name" "$temporary_directory/$checksum_name" ||
+        fail "could not download $checksum_name from $asset_base. For a private repository, run 'gh auth login' and retry"
+}
+
+verify_staged_binary() {
+    probe_directory="$temporary_directory/probe-$target"
+    mkdir "$probe_directory"
+    tar -xzf "$temporary_directory/$archive_name" -C "$probe_directory"
+    if probe_output="$("$probe_directory/discord-purge-$target/discord-purge" --version 2>&1)"; then
+        return 0
+    fi
+    case "$probe_output" in
+        *GLIBC_[0-9.]*not\ found*) return 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_archive() {
+    checksum_file="$temporary_directory/$checksum_name"
+    archive_file="$temporary_directory/$archive_name"
+    expected="$(awk 'NF { print $1; exit }' "$checksum_file")"
+    printf '%s\n' "$expected" | grep -Eq '^[0-9A-Fa-f]{64}$' ||
+        fail "the checksum file is invalid"
+
+    if command_exists sha256sum; then
+        actual="$(sha256sum "$archive_file" | awk '{ print $1 }')"
+    elif command_exists shasum; then
+        actual="$(shasum -a 256 "$archive_file" | awk '{ print $1 }')"
+    else
+        fail "sha256sum or shasum is required to verify the release"
+    fi
+    [ "$(printf '%s' "$actual" | tr 'A-F' 'a-f')" = "$(printf '%s' "$expected" | tr 'A-F' 'a-f')" ] ||
+        fail "checksum verification failed for $archive_name. The download is damaged or changed; nothing was installed. Run the installer again"
+}
+
+# shellcheck disable=SC2016 # Variables expand when the shell reads its startup file.
+configure_path() {
+    # Only the default location can be written without embedding an arbitrary
+    # user-supplied path in shell code.
+    if [ -n "${DISCORD_PURGE_INSTALL_DIR:-}" ]; then
+        case ":${PATH:-}:" in
+            *":$install_directory:"*) return ;;
+        esac
+        say "Add $install_directory to PATH to run discord-purge from any directory."
+        return
+    fi
+
+    posix_path_line='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+    case "${SHELL##*/}" in
+        bash)
+            add_path_line "${HOME}/.bashrc" "$posix_path_line"
+            # Login bash reads the first of these files, not .bashrc.
+            if [ -f "${HOME}/.bash_profile" ]; then
+                login_rc="${HOME}/.bash_profile"
+            elif [ -f "${HOME}/.bash_login" ]; then
+                login_rc="${HOME}/.bash_login"
+            else
+                login_rc="${HOME}/.profile"
+            fi
+            add_path_line "$login_rc" "$posix_path_line"
+            ;;
+        zsh)
+            add_path_line "${ZDOTDIR:-$HOME}/.zshrc" "$posix_path_line"
+            ;;
+        fish)
+            add_path_line "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" 'contains -- "$HOME/.local/bin" $PATH; or set -gx PATH "$HOME/.local/bin" $PATH'
+            ;;
+        sh | dash | ksh | ash)
+            add_path_line "${HOME}/.profile" "$posix_path_line"
+            ;;
+        *)
+            say "Add $install_directory to your shell's PATH to run discord-purge from any directory."
+            return
+            ;;
+    esac
+    say "Open a new terminal to use discord-purge, or run $install_directory/discord-purge now."
+}
+
+add_path_line() {
+    rc="$1"
+    line="$2"
+    if [ -f "$rc" ] && grep -Fqx "$line" "$rc"; then
+        return
+    fi
+    mkdir -p "$(dirname "$rc")"
+    printf '\n%s\n' "$line" >> "$rc"
+    say "Added $install_directory to PATH in $rc"
+}
+
+install_binary() {
+    command_exists tar || fail "tar is required to extract $archive_name"
+    extract_directory="$temporary_directory/extract"
+    mkdir "$extract_directory"
+    tar -xzf "$temporary_directory/$archive_name" -C "$extract_directory"
+
+    binary="$extract_directory/discord-purge-$target/discord-purge"
+    [ -f "$binary" ] || binary="$extract_directory/discord-purge"
+    [ -f "$binary" ] || fail "the release archive does not contain discord-purge"
+
+    install_directory="${DISCORD_PURGE_INSTALL_DIR:-${HOME:?HOME is not set}/.local/bin}"
+    mkdir -p "$install_directory"
+    staged="$(mktemp "$install_directory/.discord-purge.install.XXXXXX")" ||
+        fail "could not create a staged executable in $install_directory"
+    cp "$binary" "$staged"
+    chmod 0755 "$staged"
+    mv -f "$staged" "$install_directory/discord-purge"
+    staged=''
+
+    say "Installed discord-purge $version to $install_directory/discord-purge"
+    configure_path
+}
+
+umask 077
+staged=''
+temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/discord-purge-install.XXXXXX")" ||
+    fail "could not create a temporary directory"
+cleanup() {
+    rm -rf "$temporary_directory"
+    [ -z "$staged" ] || rm -f "$staged"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+resolve_tag
+detect_target
+archive_name="discord-purge-$target.tar.gz"
+checksum_name="$archive_name.sha256"
+
+say "Installing discord-purge $version for $target"
+download_release
+verify_archive
+case "$target" in
+    *-unknown-linux-gnu)
+        if verify_staged_binary; then
+            :
+        else
+            probe_status=$?
+            if [ "$probe_status" -eq 2 ]; then
+                target="${target%-gnu}-musl"
+                archive_name="discord-purge-$target.tar.gz"
+                checksum_name="$archive_name.sha256"
+                say "The glibc runtime is too old. Using the musl release for $target"
+                download_release
+                verify_archive
+            else
+                fail "the release binary could not run on this system"
+            fi
+        fi
+        ;;
+esac
+install_binary

@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<title>discord-purge</title>
+<link rel="icon" href="data:," />
+<style>
+  :root {
+    --bg: #e7ebef; --surface: #ffffff; --sunk: #f3f5f7; --ink: #141b23; --muted: #5b6875;
+    --line: #d5dce3; --mark: #f2b705; --mark-soft: #fff1b8; --mark-ink: #4a3800;
+    --redact: #141b23; --redact-ink: #ffffff; --danger: #c42b1c; --danger-soft: #fde8e5; --ok: #1f7a4d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1217; --surface: #151c23; --sunk: #10161c; --ink: #e5eaef; --muted: #8b98a5;
+      --line: #25303a; --mark: #f2b705; --mark-soft: rgba(242, 183, 5, .14); --mark-ink: #f7d15c;
+      --redact: #d9e0e6; --redact-ink: #151c23; --danger: #ff6b57; --danger-soft: rgba(255, 107, 87, .12); --ok: #4cc38a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; height: 100dvh; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr);
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased;
+  }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 4px; }
+  [hidden] { display: none !important; }
+  .muted { color: var(--muted); }
+  .err { color: var(--danger); overflow-wrap: anywhere; }
+
+  /* Top bar */
+  .top { display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--line); min-width: 0; }
+  .brand { font-weight: 650; letter-spacing: -.01em; white-space: nowrap; text-decoration: underline 3px var(--mark); text-underline-offset: 5px; text-decoration-skip-ink: auto; }
+  .seg { display: inline-flex; background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
+  .seg button { border: 0; background: none; padding: 4px 10px; border-radius: 6px; cursor: pointer; color: var(--muted); white-space: nowrap; }
+  .seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--line); font-weight: 600; }
+  .field { height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--sunk); min-width: 0; }
+  .field:focus { border-color: var(--ink); background: var(--surface); }
+  .top .field { flex: 1 1 220px; max-width: 360px; }
+  /* The token must never reach a password manager. Managers offer to save any
+     field of the password input type, and ignore autocomplete there, so this is a
+     text field outside any <form>, masked with CSS, sent with fetch, with no
+     "password" in its id, name, placeholder, or label, and it carries each
+     manager's opt-out: 1Password, LastPass, Bitwarden, Proton Pass, Dashlane
+     (data-form-type), and Keeper (keeper-ignore class). */
+  #token { -webkit-text-security: disc; }
+  .btn { height: 32px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--surface); cursor: pointer; white-space: nowrap; }
+  .btn:hover:not(:disabled) { border-color: var(--muted); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); font-weight: 600; }
+  .btn.danger { background: var(--danger); color: #fff; border-color: var(--danger); font-weight: 600; }
+  .btn.quiet { border-color: transparent; background: none; color: var(--muted); padding: 0 6px; height: 26px; }
+  .btn.quiet:hover:not(:disabled) { color: var(--ink); border-color: transparent; }
+  .who { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .who span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); }
+  .help { position: relative; }
+  .help > summary { list-style: none; cursor: pointer; color: var(--muted); white-space: nowrap; }
+  .help > summary::-webkit-details-marker { display: none; }
+  .help[open] > div { position: absolute; z-index: 5; top: 30px; left: 0; width: min(560px, 90vw); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; box-shadow: 0 12px 32px rgba(0,0,0,.18); white-space: pre-wrap; font-size: 13px; }
+
+  /* Workspace */
+  main { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr) minmax(300px, 360px); gap: 1px; background: var(--line); min-height: 0; }
+  .pane { background: var(--surface); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .pane > header { display: flex; align-items: center; gap: 8px; padding: 10px 14px 8px; min-height: 44px; }
+  .pane > header h2 { font-size: 13px; font-weight: 650; margin: 0; }
+  .pane > header .sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .scroll { overflow: auto; flex: 1; min-height: 0; overscroll-behavior: contain; }
+  main.busy #where, main.busy #messages { opacity: .55; }
+
+  /* Where */
+  .search { margin: 0 12px 6px; }
+  .sec { display: flex; align-items: center; gap: 6px; padding: 10px 14px 4px; font-size: 12px; font-weight: 650; position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  .sec .count { color: var(--muted); font-weight: 400; }
+  .sec .btn { margin-left: auto; }
+  .row { display: flex; align-items: center; gap: 6px; padding: 0 10px 0 8px; min-height: 30px; border-radius: 6px; margin: 0 6px; }
+  .row:hover { background: var(--sunk); }
+  .row.open { background: var(--mark-soft); }
+  .row input { margin: 0; accent-color: var(--mark); width: 15px; height: 15px; flex: none; }
+  .row .name { flex: 1; min-width: 0; text-align: left; border: 0; background: none; padding: 5px 0; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.on .name { font-weight: 600; }
+  .row.child { padding-left: 34px; }
+  .disc { border: 0; background: none; width: 18px; height: 22px; cursor: pointer; color: var(--muted); flex: none; padding: 0; transition: transform .15s; }
+  .disc[aria-expanded="true"] { transform: rotate(90deg); }
+  .row .note { color: var(--muted); font-size: 12px; }
+  .addlink { border-top: 1px solid var(--line); padding: 10px 12px; display: grid; gap: 6px; }
+  .addlink form { display: flex; gap: 6px; }
+  .addlink .field { flex: 1; }
+  .choice { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; }
+  .empty { padding: 18px 16px; color: var(--muted); }
+
+  /* Messages */
+  .rangebar { display: flex; align-items: center; gap: 8px; margin-left: auto; font-size: 12px; min-width: 0; }
+  .rangebar .chip { background: var(--mark-soft); color: var(--mark-ink); padding: 3px 8px; border-radius: 999px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+  ol.msgs { list-style: none; margin: 0; padding: 0 0 8px; }
+  .msg { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 2px 10px; padding: 7px 14px; border-top: 1px solid var(--sunk); align-items: start; }
+  .msg:hover, .msg:focus-within { background: var(--sunk); }
+  .msg input { margin: 3px 0 0; accent-color: var(--mark); width: 15px; height: 15px; }
+  .msg .meta { font-size: 12px; color: var(--muted); display: flex; gap: 8px; }
+  .msg .meta b { color: var(--ink); font-weight: 600; }
+  .msg .txt { overflow-wrap: anywhere; white-space: pre-wrap; }
+  .msg.other .txt { color: var(--muted); }
+  /* Messages the plan deletes are redacted: an ink bar, revealed on hover. */
+  .msg.doomed .txt > span { background: var(--redact); color: transparent; border-radius: 2px; padding: 0 2px; -webkit-box-decoration-break: clone; box-decoration-break: clone; transition: color .12s; }
+  .msg.doomed:hover .txt > span, .msg.doomed:focus-within .txt > span { color: var(--redact-ink); }
+  .msg.anchor { box-shadow: inset 3px 0 0 var(--mark); background: var(--mark-soft); }
+  .msg .acts { display: flex; gap: 2px; opacity: 0; }
+  .msg:hover .acts, .msg:focus-within .acts { opacity: 1; }
+  @media (hover: none) { .msg .acts { opacity: 1; } }
+  .more { padding: 10px 14px; color: var(--muted); }
+
+  /* Plan */
+  #plan .scroll { padding: 0 16px 12px; display: grid; gap: 14px; align-content: start; }
+  .sum { display: grid; gap: 6px; }
+  .sum p { margin: 0; display: grid; grid-template-columns: 64px 1fr; gap: 8px; }
+  .sum p span:first-child { color: var(--muted); font-size: 12px; padding-top: 1px; }
+  fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 8px; }
+  legend { font-size: 13px; font-weight: 650; padding: 0; margin-bottom: 6px; }
+  label.l { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  label.l .field { color: var(--ink); font-size: 14px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .types { display: flex; flex-wrap: wrap; gap: 4px; }
+  .types button { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 2px 10px; cursor: pointer; font-size: 13px; }
+  .types button[aria-pressed="true"] { background: var(--mark); border-color: var(--mark); color: #2a2000; font-weight: 600; }
+  .check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  .check input { accent-color: var(--mark); margin: 0; }
+  details.speed > summary { cursor: pointer; font-size: 13px; font-weight: 650; }
+  details.speed[open] > summary { margin-bottom: 8px; }
+  .act { border-top: 1px solid var(--line); padding: 12px 16px 14px; display: grid; gap: 10px; background: var(--surface); }
+  .total { display: flex; align-items: baseline; gap: 8px; }
+  .total b { font-size: 40px; line-height: 1; font-weight: 650; letter-spacing: -.03em; }
+  .jobs { max-height: 132px; overflow: auto; margin: 0; padding: 0; list-style: none; font-size: 13px; border: 1px solid var(--line); border-radius: 8px; }
+  .jobs li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 10px; border-top: 1px solid var(--sunk); }
+  .jobs li:first-child { border-top: 0; }
+  .jobs li span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .confirm { border: 1px solid var(--danger); background: var(--danger-soft); border-radius: 10px; padding: 10px 12px; display: grid; gap: 8px; }
+  .confirm .btns { display: flex; gap: 8px; }
+  .status { font-size: 13px; min-height: 18px; overflow-wrap: anywhere; }
+  .stale { color: var(--mark-ink); }
+
+  /* Run */
+  .bar { height: 10px; background: var(--sunk); border-radius: 5px; overflow: hidden; border: 1px solid var(--line); }
+  .bar span { display: block; height: 100%; width: 0; background: var(--mark); transition: width .4s ease-out; }
+  .nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; }
+  .nums div b { display: block; font-size: 20px; font-weight: 650; }
+  .nums div span { font-size: 12px; color: var(--muted); }
+  .log { font-size: 12px; display: grid; gap: 4px; }
+  .log .bad { color: var(--danger); }
+
+  nav.tabs { display: none; }
+  @media (max-width: 899px) {
+    body { grid-template-rows: auto minmax(0, 1fr) auto; }
+    .top { flex-wrap: wrap; padding: 8px 12px; }
+    .top .field { flex-basis: 100%; max-width: none; order: 5; }
+    .top .loadbtn { order: 6; }
+    .who { margin-left: 0; order: 2; }
+    main { grid-template-columns: minmax(0, 1fr); }
+    main > .pane { display: none; }
+    main[data-tab="where"] #where, main[data-tab="messages"] #messages, main[data-tab="plan"] #plan { display: flex; }
+    nav.tabs { display: grid; grid-template-columns: repeat(3, 1fr); background: var(--surface); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); }
+    nav.tabs button { border: 0; background: none; padding: 10px 0 12px; cursor: pointer; color: var(--muted); }
+    nav.tabs button[aria-selected="true"] { color: var(--ink); font-weight: 650; box-shadow: inset 0 3px 0 var(--mark); }
+    input, select, .field { font-size: 16px; }
+    .msg .acts { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="top">
+  <span class="brand">discord-purge</span>
+  <div class="seg" role="group" aria-label="Source">
+    <button id="modeAccount" aria-pressed="true">Discord account</button>
+    <button id="modePackage" aria-pressed="false">Data package</button>
+  </div>
+  <input id="pkg" class="field" placeholder="Path to package.zip or its folder" autocomplete="off" spellcheck="false" hidden aria-label="Data package path" />
+  <input id="token" class="field keeper-ignore" type="text" placeholder="Paste your account token" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-protonpass-ignore data-form-type="other" aria-label="Account token" />
+  <button id="load" class="btn primary loadbtn">Load</button>
+  <details class="help"><summary>Find my token</summary><div id="tokenHelp"></div></details>
+  <div class="who" role="status" aria-live="polite"><i class="dot" id="whoDot"></i><span id="who">Not loaded</span></div>
+</div>
+
+<main id="main" data-tab="where">
+  <section class="pane" id="where" aria-label="Where">
+    <header><h2>Where</h2><span class="sub" id="whereSub"></span></header>
+    <input id="search" class="field search" type="search" placeholder="Find a server, channel, or DM" aria-label="Find by name" />
+    <div class="scroll" id="tree"><p class="empty">Load your account or a data package to list servers and DMs.</p></div>
+    <div class="addlink">
+      <form id="linkForm"><input id="link" class="field" placeholder="Paste a Discord link or DM ID" aria-label="Discord link or DM channel ID" autocomplete="off" /><button class="btn">Add</button></form>
+      <div id="linkChoice" class="choice" hidden></div>
+    </div>
+  </section>
+
+  <section class="pane" id="messages" aria-label="Messages">
+    <header>
+      <h2>Messages</h2><span class="sub" id="msgSub">Open a channel or DM</span>
+      <div class="rangebar"><span class="chip" id="rangeChip">All your messages</span><button class="btn quiet" id="clearRange" hidden>Clear</button></div>
+    </header>
+    <div class="scroll" id="history"><p class="empty">Select a channel or DM name to read its messages. Mark single messages, or make one a boundary: everything older or newer goes. Messages the plan deletes are covered by a bar.</p></div>
+  </section>
+
+  <section class="pane" id="plan" aria-label="Plan">
+    <header><h2 id="planTitle">Plan</h2></header>
+    <div class="scroll" id="planBody">
+      <div class="sum">
+        <p><span>Scope</span><span id="scopeText"></span></p>
+        <p><span>Range</span><span id="rangeText"></span></p>
+      </div>
+      <fieldset>
+        <legend>Filters</legend>
+        <label class="l">Text contains (or /regex/i)<input id="content" class="field" autocomplete="off" spellcheck="false" /></label>
+        <div class="types" id="types" role="group" aria-label="Message types (none means all)"></div>
+        <div class="two">
+          <label class="l">From (UTC)<input id="after_date" class="field" type="date" /></label>
+          <label class="l">To (UTC)<input id="before_date" class="field" type="date" /></label>
+        </div>
+        <label class="check"><input id="include_pinned" type="checkbox" />Delete pinned messages too</label>
+      </fieldset>
+      <details class="speed">
+        <summary>Speed</summary>
+        <div class="three">
+          <label class="l">Workers<input id="workers" class="field" type="number" min="1" max="16" /></label>
+          <label class="l">Delay (s)<input id="delay" class="field" type="number" step="0.1" min="0" max="3600" /></label>
+          <label class="l">Jitter<input id="jitter" class="field" type="number" step="0.1" min="0" max="1" /></label>
+        </div>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">Workers delete in that many channels at a time. Each channel waits the delay ± jitter between deletes.</p>
+      </details>
+    </div>
+    <div class="act" id="act"></div>
+    <div class="scroll act" id="runView" hidden></div>
+  </section>
+</main>
+
+<nav class="tabs" role="tablist" aria-label="Panes">
+  <button role="tab" data-tab="where" aria-selected="true">Where</button>
+  <button role="tab" data-tab="messages" aria-selected="false">Messages</button>
+  <button role="tab" data-tab="plan" aria-selected="false" id="planTab">Plan</button>
+</nav>
+
+<script>
+const $ = (id) => document.getElementById(id);
+/** Build an element. Strings become text nodes, so Discord text is never parsed as HTML. */
+function h(tag, props = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'class') el.className = v;
+    else if (v === true) el.setAttribute(k, '');
+    else if (v !== false && v != null) el.setAttribute(k, v);
+  }
+  el.append(...children.flat().filter((c) => c != null && c !== false));
+  return el;
+}
+const session = new URLSearchParams(location.hash.slice(1)).get('session') || '';
+const TYPES = ['text', 'image', 'video', 'audio', 'voice', 'file', 'link'];
+const NON_DELETABLE = [1, 2, 3, 4, 5, 21, 35, 64];
+const S = {
+  mode: 'account', hasToken: false, defaults: {}, account: null, gen: 0,
+  servers: [], dms: [], history: null,
+  range: { kind: 'all', anchor: null, picked: new Map() },
+  revision: 0, preview: null, previewing: false, confirming: false, running: false, error: '',
+};
+const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+const when = (id) => {
+  try { return new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }); }
+  catch { return ''; }
+};
+const channelLabel = (c) => c.name || (c.recipients || []).map((u) => u.global_name || u.username).join(', ') || `channel ${c.id}`;
+
+async function api(path, body) {
+  const response = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { 'content-type': 'application/json', 'x-discord-purge-session': session },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error(response.status === 403 ? 'This page has no valid session. Open the full URL that the app printed, including #session=.' : `The panel answered with status ${response.status}. Restart the app and open the printed URL.`); }
+  if (data.ok === false) throw new Error(data.error);
+  return data;
+}
+const source = () => ({ token: $('token').value.trim(), package: S.mode === 'package' ? $('pkg').value.trim() : '' });
+
+/* ---------- Source and lists ---------- */
+function setMode(mode) {
+  S.mode = mode;
+  $('modeAccount').setAttribute('aria-pressed', mode === 'account');
+  $('modePackage').setAttribute('aria-pressed', mode === 'package');
+  $('pkg').hidden = mode !== 'package';
+  $('token').placeholder = S.hasToken ? 'Saved token in use' : mode === 'package' ? 'Token (needed only to delete)' : 'Paste your account token';
+}
+// The server saved the typed token, so later requests can leave the field empty.
+function tokenSaved() {
+  S.hasToken = true;
+  $('token').value = '';
+  setMode(S.mode);
+}
+$('modeAccount').onclick = () => setMode('account');
+$('modePackage').onclick = () => { setMode('package'); $('pkg').focus(); };
+$('load').onclick = loadCatalog;
+for (const id of ['token', 'pkg']) $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') loadCatalog(); });
+$('token').addEventListener('input', () => { if (S.preview) { S.preview = null; renderPlan(); } });
+
+function changed() { S.revision++; S.confirming = false; renderPlan(); }
+function fail(e) { S.error = String(e.message || e); renderPlan(); setTab('plan', true); }
+
+async function loadCatalog() {
+  const gen = ++S.gen;
+  Object.assign(S, { servers: [], dms: [], history: null, account: null, error: '', preview: null });
+  S.range = { kind: 'all', anchor: null, picked: new Map() };
+  $('who').textContent = 'Loading…'; $('whoDot').className = 'dot';
+  $('load').disabled = true;
+  renderAll();
+  try {
+    const res = await api('/api/catalog', source());
+    if (gen !== S.gen) return;
+    S.account = res.account;
+    if (res.token_saved) tokenSaved();
+    S.servers = res.guilds.map((g) => ({ id: g.id, name: g.name, all: false, picked: new Set(), expanded: false, channels: null, loading: false }));
+    S.dms = res.dms.map((c) => ({ channel: c, checked: false }));
+    const { guild, channel } = S.defaults;
+    if (guild) { const s = S.servers.find((s) => s.id === guild); if (s) { if (channel) s.picked.add(channel); else s.all = true; } }
+    else if (channel) { const d = S.dms.find((d) => d.channel.id === channel); if (d) d.checked = true; else S.dms.push({ channel: { id: channel, name: `DM ${channel}`, type: 1 }, checked: true }); }
+    S.defaults.guild = S.defaults.channel = null;
+    $('who').textContent = S.mode === 'package' ? `Package · ${plural(S.servers.length, 'server', 'servers')}, ${plural(S.dms.length, 'DM', 'DMs')}` : (res.account.global_name || res.account.username);
+    $('whoDot').className = 'dot on';
+  } catch (e) {
+    if (gen !== S.gen) return;
+    $('who').textContent = 'Not loaded';
+    fail(e);
+  } finally {
+    if (gen === S.gen) $('load').disabled = false;
+    changed(); renderAll();
+  }
+}
+
+async function loadChannels(server) {
+  if (server.loading || server.channels) return;
+  const gen = S.gen; server.loading = true; renderWhere();
+  try {
+    const res = await api('/api/channels', { ...source(), guild_ids: [server.id] });
+    if (gen === S.gen) server.channels = res.channels;
+  } catch (e) { server.expanded = false; fail(e); }
+  finally { server.loading = false; if (gen === S.gen) renderWhere(); }
+}
+
+async function openHistory(channel, older = false) {
+  if (!older && S.history?.channel.id === channel.id) { setTab('messages'); return; }
+  if (!older) S.history = { channel, messages: [], more: false, loading: false };
+  const history = S.history;
+  if (history.loading) return;
+  const gen = S.gen; history.loading = true;
+  renderWhere(); renderMessages(); setTab('messages');
+  try {
+    const res = await api('/api/messages', { ...source(), channel_id: channel.id, before: older ? history.messages.at(-1)?.id : null });
+    if (gen !== S.gen || S.history !== history) return;
+    history.messages = older ? history.messages.concat(res.messages) : res.messages;
+    history.more = res.more;
+  } catch (e) { fail(e); }
+  finally { history.loading = false; if (S.history === history) renderMessages(); }
+}
+
+/* ---------- Selection model ---------- */
+function inScope(c) {
+  if (c.guild_id) { const s = S.servers.find((s) => s.id === c.guild_id); return !!s && (s.all || s.picked.has(c.id)); }
+  return S.dms.some((d) => d.checked && d.channel.id === c.id);
+}
+function ensureInScope(c) {
+  if (inScope(c)) return;
+  if (c.guild_id) {
+    let s = S.servers.find((s) => s.id === c.guild_id);
+    if (!s) { s = { id: c.guild_id, name: `Server ${c.guild_id}`, all: false, picked: new Set(), expanded: false, channels: null, loading: false }; S.servers.push(s); }
+    s.picked.add(c.id);
+  } else {
+    const d = S.dms.find((d) => d.channel.id === c.id);
+    if (d) d.checked = true; else S.dms.push({ channel: c, checked: true });
+  }
+  renderWhere();
+}
+function targets() {
+  const out = [];
+  for (const s of S.servers) {
+    if (s.all) out.push({ kind: 'guild', guild_id: s.id, channel: null });
+    else for (const c of s.picked) out.push({ kind: 'guild', guild_id: s.id, channel: c });
+  }
+  for (const d of S.dms) if (d.checked) out.push({ kind: 'dm', channel_id: d.channel.id });
+  return out;
+}
+function rangeBody() {
+  const r = S.range;
+  if (r.kind === 'older' || r.kind === 'newer') return { kind: r.kind, anchor: r.anchor };
+  if (r.kind === 'only') return { kind: 'only', messages: [...r.picked.values()] };
+  return { kind: 'all' };
+}
+const own = (m) => S.account && m.author.id === S.account.id && !NON_DELETABLE.includes(m.type || 0) && (!m.pinned || $('include_pinned').checked);
+function inRange(m) {
+  if (!S.history || !own(m) || !inScope(S.history.channel)) return false;
+  const r = S.range, id = BigInt(m.id);
+  if (r.kind === 'older') return id < BigInt(r.anchor.message_id);
+  if (r.kind === 'newer') return id > BigInt(r.anchor.message_id);
+  if (r.kind === 'only') return r.picked.has(`${m.channel_id}:${m.id}`);
+  return true;
+}
+function setRange(kind, ref, channel) {
+  if (channel) ensureInScope(channel);
+  if (kind === 'only') {
+    const key = `${ref.channel_id}:${ref.message_id}`;
+    if (S.range.kind !== 'only') S.range = { kind: 'only', anchor: null, picked: new Map() };
+    if (S.range.picked.has(key)) S.range.picked.delete(key); else S.range.picked.set(key, ref);
+  } else if (kind === 'all') S.range = { kind: 'all', anchor: null, picked: new Map() };
+  else S.range = { kind, anchor: ref, picked: new Map() };
+  changed(); renderMessages();
+}
+
+/* ---------- Where ---------- */
+$('search').addEventListener('input', renderWhere);
+function renderWhere() {
+  const tree = $('tree');
+  const chosen = S.servers.filter((s) => s.all || s.picked.size).length + S.dms.filter((d) => d.checked).length;
+  $('whereSub').textContent = S.account ? `${chosen} selected` : '';
+  if (!S.account) {
+    tree.replaceChildren(h('p', { class: 'empty' }, $('load').disabled ? 'Loading your servers and DMs…' : 'Load your account or a data package to list servers and DMs.'));
+    return;
+  }
+  const q = $('search').value.trim().toLowerCase();
+  const hit = (s) => !q || s.toLowerCase().includes(q);
+  const openId = S.history?.channel.id;
+  const nodes = [];
+  const shownServers = S.servers.filter((s) => hit(s.name) || (s.channels || []).some((c) => hit(channelLabel(c))));
+  const allServers = shownServers.length > 0 && shownServers.every((s) => s.all);
+  nodes.push(h('div', { class: 'sec' }, 'Servers', h('span', { class: 'count' }, `${S.servers.filter((s) => s.all || s.picked.size).length} of ${S.servers.length}`),
+    shownServers.length ? h('button', { class: 'btn quiet', onclick: () => { for (const s of shownServers) { s.all = !allServers; s.picked.clear(); } changed(); renderAll(); } }, allServers ? 'Clear' : 'Select all') : null));
+  for (const s of shownServers) {
+    const box = h('input', { type: 'checkbox', 'aria-label': `Whole server ${s.name}`, onchange: () => { s.all = box.checked; s.picked.clear(); changed(); renderAll(); } });
+    box.checked = s.all; box.indeterminate = !s.all && s.picked.size > 0;
+    const toggle = () => { s.expanded = !s.expanded; if (s.expanded) loadChannels(s); renderWhere(); };
+    nodes.push(h('div', { class: `row${s.all || s.picked.size ? ' on' : ''}` },
+      h('button', { class: 'disc', 'aria-expanded': String(s.expanded), 'aria-label': `Show channels of ${s.name}`, onclick: toggle }, '▸'),
+      box, h('button', { class: 'name', onclick: toggle, title: s.name }, s.name),
+      s.loading ? h('span', { class: 'note' }, 'loading') : null));
+    if (s.expanded && s.channels) {
+      const channels = s.channels.filter((c) => hit(s.name) || hit(channelLabel(c)));
+      if (!channels.length) nodes.push(h('div', { class: 'row child note' }, 'No channels listed. Whole-server search still covers threads.'));
+      for (const c of channels) {
+        const on = s.all || s.picked.has(c.id);
+        const cb = h('input', { type: 'checkbox', 'aria-label': `Channel ${channelLabel(c)}`, onchange: () => {
+          if (s.all) { s.all = false; s.picked = new Set(s.channels.map((x) => x.id)); s.picked.delete(c.id); }
+          else if (cb.checked) s.picked.add(c.id); else s.picked.delete(c.id);
+          changed(); renderAll();
+        } });
+        cb.checked = on;
+        nodes.push(h('div', { class: `row child${on ? ' on' : ''}${openId === c.id ? ' open' : ''}` }, cb,
+          h('button', { class: 'name', onclick: () => openHistory(c), title: 'Read messages' }, `# ${channelLabel(c)}`)));
+      }
+    }
+  }
+  const shownDms = S.dms.filter((d) => hit(channelLabel(d.channel)));
+  const allDms = shownDms.length > 0 && shownDms.every((d) => d.checked);
+  nodes.push(h('div', { class: 'sec' }, 'Direct messages', h('span', { class: 'count' }, `${S.dms.filter((d) => d.checked).length} of ${S.dms.length}`),
+    shownDms.length ? h('button', { class: 'btn quiet', onclick: () => { for (const d of shownDms) d.checked = !allDms; changed(); renderAll(); } }, allDms ? 'Clear' : 'Select all') : null));
+  if (!S.dms.length) nodes.push(h('p', { class: 'empty' }, 'No open DMs. Paste a closed DM link or ID below.'));
+  for (const d of shownDms) {
+    const cb = h('input', { type: 'checkbox', 'aria-label': `DM ${channelLabel(d.channel)}`, onchange: () => { d.checked = cb.checked; changed(); renderAll(); } });
+    cb.checked = d.checked;
+    nodes.push(h('div', { class: `row${d.checked ? ' on' : ''}${openId === d.channel.id ? ' open' : ''}` }, cb,
+      h('button', { class: 'name', onclick: () => openHistory(d.channel), title: 'Read messages' }, channelLabel(d.channel))));
+  }
+  tree.replaceChildren(...nodes);
+}
+
+/* Paste a link: add its channel; a message link also asks for the range. */
+$('linkForm').onsubmit = (e) => {
+  e.preventDefault();
+  const value = $('link').value.trim();
+  const choice = $('linkChoice');
+  try {
+    let guild = null, channel, message = null;
+    if (/^[1-9]\d*$/.test(value)) channel = value;
+    else {
+      const url = new URL(value);
+      const parts = url.pathname.split('/').filter(Boolean);
+      const hosts = ['discord.com', 'www.discord.com', 'ptb.discord.com', 'canary.discord.com', 'discordapp.com'];
+      if (!hosts.includes(url.hostname) || parts[0] !== 'channels' || parts.length < 3 || parts.length > 4) throw 0;
+      [guild, channel, message] = [parts[1] === '@me' ? null : parts[1], parts[2], parts[3] || null];
+      if (![guild, channel, message].every((id) => id === null || /^[1-9]\d*$/.test(id))) throw 0;
+    }
+    const known = S.servers.flatMap((s) => s.channels || []).concat(S.dms.map((d) => d.channel)).find((c) => c.id === channel);
+    const c = known || (guild ? { id: channel, name: `channel ${channel}`, type: 0, guild_id: guild } : { id: channel, name: `DM ${channel}`, type: 1 });
+    ensureInScope(c); changed(); $('link').value = '';
+    if (!message) { choice.hidden = true; return; }
+    const ref = { channel_id: channel, message_id: message };
+    const pick = (kind) => () => { setRange(kind, ref, null); choice.hidden = true; };
+    choice.replaceChildren(h('span', { class: 'muted' }, `Message from ${when(message)}:`),
+      h('button', { class: 'btn quiet', onclick: pick('older') }, 'Older than it'),
+      h('button', { class: 'btn quiet', onclick: pick('newer') }, 'Newer than it'),
+      h('button', { class: 'btn quiet', onclick: pick('only') }, 'Only it'));
+    choice.hidden = false;
+  } catch {
+    choice.hidden = false;
+    choice.replaceChildren(h('span', { class: 'err' }, 'Paste a link from Discord\'s Copy Link (https://discord.com/channels/…) or a DM channel ID, then select Add.'));
+  }
+};
+
+/* ---------- Messages ---------- */
+$('clearRange').onclick = () => setRange('all');
+function renderMessages() {
+  const r = S.range;
+  $('rangeChip').textContent = r.kind === 'older' ? `Older than ${when(r.anchor.message_id)}` : r.kind === 'newer' ? `Newer than ${when(r.anchor.message_id)}` : r.kind === 'only' ? `${plural(r.picked.size, 'marked message', 'marked messages')}` : 'All your messages';
+  $('clearRange').hidden = r.kind === 'all';
+  const area = $('history');
+  const history = S.history;
+  if (!history) return;
+  $('msgSub').textContent = (history.channel.guild_id ? '# ' : '') + channelLabel(history.channel);
+  if (!history.messages.length) {
+    area.replaceChildren(h('p', { class: 'empty' }, history.loading ? 'Loading messages…' : 'This channel has no messages to show.'));
+    return;
+  }
+  const anchorKey = r.anchor ? `${r.anchor.channel_id}:${r.anchor.message_id}` : null;
+  const list = h('ol', { class: 'msgs' });
+  for (const m of history.messages) {
+    const key = `${m.channel_id}:${m.id}`, ref = { channel_id: m.channel_id, message_id: m.id }, mine = own(m), doomed = inRange(m);
+    const box = mine ? h('input', { type: 'checkbox', 'aria-label': 'Mark this message', onchange: () => setRange('only', ref, history.channel) }) : h('span');
+    if (mine) box.checked = r.kind === 'only' && r.picked.has(key);
+    let text = m.content || (m.attachments?.length ? `[${m.attachments.map((a) => a.filename).join(', ')}]` : '[no text]');
+    list.append(h('li', { class: `msg${mine ? '' : ' other'}${doomed ? ' doomed' : ''}${anchorKey === key ? ' anchor' : ''}` },
+      box,
+      h('div', {},
+        h('div', { class: 'meta' }, h('b', {}, m.author.global_name || m.author.username), h('time', {}, when(m.id)), m.pinned ? 'pinned' : null, anchorKey === key ? 'boundary, stays' : null),
+        h('div', { class: 'txt' }, h('span', {}, text), doomed ? h('em', { hidden: true }, ' (will be deleted)') : null)),
+      h('div', { class: 'acts' },
+        h('button', { class: 'btn quiet', title: 'Delete your messages older than this one', onclick: () => setRange('older', ref, history.channel) }, 'Older'),
+        h('button', { class: 'btn quiet', title: 'Delete your messages newer than this one', onclick: () => setRange('newer', ref, history.channel) }, 'Newer'))));
+  }
+  const tail = history.loading ? h('p', { class: 'more' }, 'Loading older messages…')
+    : history.more ? h('p', { class: 'more' }, h('button', { class: 'btn', onclick: () => openHistory(history.channel, true) }, 'Load older messages'))
+    : h('p', { class: 'more' }, 'Start of the history');
+  const top = area.scrollTop;
+  area.replaceChildren(list, tail);
+  area.scrollTop = top;
+}
+
+/* ---------- Plan ---------- */
+for (const t of TYPES) $('types').append(h('button', { 'aria-pressed': 'false', 'data-type': t, onclick: (e) => { e.currentTarget.setAttribute('aria-pressed', e.currentTarget.getAttribute('aria-pressed') !== 'true'); changed(); } }, t));
+for (const id of ['content', 'after_date', 'before_date']) $(id).addEventListener('input', changed);
+$('include_pinned').addEventListener('change', () => { changed(); renderMessages(); });
+
+function scopeText() {
+  const whole = S.servers.filter((s) => s.all).length, channels = S.servers.reduce((n, s) => n + s.picked.size, 0), dms = S.dms.filter((d) => d.checked).length;
+  const parts = [whole && plural(whole, 'whole server', 'whole servers'), channels && plural(channels, 'channel', 'channels'), dms && plural(dms, 'DM', 'DMs')].filter(Boolean);
+  return parts.length ? parts.join(', ') : 'Nothing selected yet. Check servers, channels, or DMs.';
+}
+function rangeText() {
+  const r = S.range;
+  if (r.kind === 'older') return `Your messages older than the one from ${when(r.anchor.message_id)}. That one stays.`;
+  if (r.kind === 'newer') return `Your messages newer than the one from ${when(r.anchor.message_id)}. That one stays.`;
+  if (r.kind === 'only') return r.picked.size ? `Only ${plural(r.picked.size, 'marked message', 'marked messages')}` : 'No messages marked. Check messages, or clear the range.';
+  return 'All your messages in the scope';
+}
+const types = () => [...$('types').querySelectorAll('[aria-pressed="true"]')].map((b) => b.dataset.type).join(',');
+
+function renderPlan() {
+  $('scopeText').textContent = scopeText();
+  $('rangeText').textContent = rangeText();
+  const act = $('act');
+  const nodes = [];
+  if (S.error) nodes.push(h('p', { class: 'status err', role: 'alert' }, S.error));
+  const p = S.preview, fresh = p && p.revision === S.revision;
+  if (fresh) {
+    nodes.push(h('div', { class: 'total' }, h('b', {}, p.total.toLocaleString()), h('span', { class: 'muted' }, `${p.total === 1 ? 'message' : 'messages'} in ${plural(p.channels.length, 'channel', 'channels')}. Nothing deleted yet.`)));
+    if (S.mode === 'package') nodes.push(h('p', { class: 'status muted' }, 'A package cannot show pins or access, so this is a maximum.'));
+    if (p.channels.length) nodes.push(h('ul', { class: 'jobs' }, p.channels.map((c) => h('li', {}, h('span', { title: c.label }, c.label), h('span', {}, c.count.toLocaleString())))));
+    const noToken = !S.hasToken && !$('token').value.trim();
+    if (S.confirming) {
+      nodes.push(h('div', { class: 'confirm', role: 'alertdialog', 'aria-label': 'Confirm deletion' },
+        h('strong', {}, `Delete ${plural(p.total, 'message', 'messages')} for good?`),
+        h('span', {}, 'This cannot be undone. Only the previewed messages are deleted.'),
+        h('div', { class: 'btns' }, h('button', { class: 'btn danger', id: 'confirmYes', onclick: startRun }, `Delete ${p.total.toLocaleString()}`), h('button', { class: 'btn', onclick: () => { S.confirming = false; renderPlan(); } }, 'Cancel'))));
+    } else {
+      nodes.push(h('div', { class: 'two' },
+        h('button', { class: 'btn danger', id: 'deleteBtn', disabled: !p.total || noToken, onclick: () => { S.confirming = true; renderPlan(); $('confirmYes')?.focus(); } }, p.total ? `Delete ${p.total.toLocaleString()}…` : 'Nothing to delete'),
+        h('button', { class: 'btn', onclick: preview }, 'Preview again')));
+      if (noToken && p.total) nodes.push(h('p', { class: 'status muted' }, 'Add your token in the top bar to delete.'));
+    }
+  } else {
+    if (p) nodes.push(h('p', { class: 'status stale' }, 'The selection changed after the preview. Preview again to see the new count.'));
+    nodes.push(h('button', { class: 'btn primary', id: 'previewBtn', disabled: S.previewing || !S.account, onclick: preview }, S.previewing ? 'Counting…' : 'Preview exact messages'));
+    if (!p && !S.error) nodes.push(h('p', { class: 'status muted' }, 'Counts what would be deleted. Nothing is deleted until you confirm.'));
+  }
+  act.replaceChildren(...nodes);
+  $('planTab').textContent = fresh ? `Plan · ${p.total.toLocaleString()}` : 'Plan';
+}
+
+async function preview() {
+  S.error = ''; S.previewing = true; S.confirming = false; renderPlan();
+  const revision = S.revision;
+  try {
+    const res = await api('/api/preview', {
+      ...source(), selection: { targets: targets(), range: rangeBody(), include_pinned: $('include_pinned').checked },
+      content: $('content').value, types: types(), after_date: $('after_date').value, before_date: $('before_date').value, include_pinned: $('include_pinned').checked,
+    });
+    if (revision === S.revision) S.preview = { ...res, revision };
+    else S.error = 'The selection changed while counting. Preview again.';
+  } catch (e) { S.error = String(e.message || e); }
+  finally { S.previewing = false; renderPlan(); setTab('plan', true); }
+}
+
+/* ---------- Run ---------- */
+async function startRun() {
+  $('confirmYes').disabled = true;
+  try {
+    await api('/api/run', { token: $('token').value.trim(), preview_id: S.preview.preview_id, execute: true, workers: +$('workers').value, delay: +$('delay').value, jitter: +$('jitter').value });
+    S.preview = null; S.confirming = false;
+    if (S.defaults.saves_token && $('token').value.trim()) tokenSaved();
+  } catch (e) { S.confirming = false; S.error = String(e.message || e); renderPlan(); }
+}
+
+let paused = false;
+async function control(action) {
+  try { await api('/api/control', { action }); if (action !== 'stop') paused = action === 'pause'; }
+  catch (e) { S.error = String(e.message || e); }
+}
+function showRun(s) {
+  const runView = $('runView');
+  if (!S.running) {
+    S.running = true; paused = false;
+    $('planBody').hidden = true; $('act').hidden = true; runView.hidden = false;
+    $('main').classList.add('busy'); $('where').inert = true; $('messages').inert = true; $('load').disabled = true;
+    setTab('plan', true);
+  }
+  $('planTitle').textContent = s.finished ? (s.aborted ? 'Stopped' : 'Finished') : paused ? 'Paused' : 'Deleting';
+  const pct = s.total > 0 ? Math.min(100, (s.processed / s.total) * 100) : 0;
+  const t = (secs) => secs == null ? '—' : [Math.floor(secs / 3600), Math.floor(secs % 3600 / 60), secs % 60].map((n) => String(n).padStart(2, '0')).join(':');
+  const reasons = [...(s.errors || [])];
+  for (const f of s.forbidden || []) if (!reasons.some((r) => r.includes(f.reason))) reasons.push(`${f.label}: ${f.reason} (${plural(f.count, 'message', 'messages')})`);
+  runView.replaceChildren(
+    h('div', { class: 'total' }, h('b', {}, s.deleted.toLocaleString()), h('span', { class: 'muted' }, `deleted of ${s.total.toLocaleString()}`)),
+    h('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(s.total), 'aria-valuenow': String(s.processed) }, h('span', { style: `width:${pct}%` })),
+    h('div', { class: 'nums' },
+      ...[[s.skipped, 'skipped'], [s.failed, 'failed'], [(s.rate || 0).toFixed(2), 'per second'], [t(s.elapsed_secs), 'elapsed'], [t(s.eta_secs), 'left'], [`${s.processed}/${s.total}`, 'processed']]
+        .map(([v, l]) => h('div', {}, h('b', {}, String(v)), h('span', {}, l)))),
+    h('p', { class: 'status', role: 'status' }, s.status || ''),
+    h('div', { class: 'log' },
+      (s.workers || []).map((w) => h('div', {}, `▸ ${w.channel}  ${w.done}/${w.total}`)),
+      reasons.map((r) => h('div', { class: 'bad' }, r))),
+    s.finished
+      ? h('button', { class: 'btn primary', onclick: endRun }, 'New selection')
+      : h('div', { class: 'two' },
+          h('button', { class: 'btn', onclick: async () => { await control(paused ? 'resume' : 'pause'); } }, paused ? 'Continue' : 'Pause'),
+          h('button', { class: 'btn danger', onclick: () => control('stop') }, 'Stop')));
+}
+function endRun() {
+  S.running = false;
+  $('planBody').hidden = false; $('act').hidden = false; $('runView').hidden = true;
+  $('main').classList.remove('busy'); $('where').inert = false; $('messages').inert = false; $('load').disabled = false;
+  $('planTitle').textContent = 'Plan';
+  // Deleted messages are gone: reload history and drop a range that names one.
+  S.history = null; S.range = { kind: 'all', anchor: null, picked: new Map() };
+  $('history').replaceChildren(h('p', { class: 'empty' }, 'Open a channel or DM to read its current messages.'));
+  $('msgSub').textContent = 'Open a channel or DM';
+  changed(); renderAll();
+}
+function connectEvents() {
+  const es = new EventSource('/api/events?session=' + encodeURIComponent(session));
+  es.onmessage = (ev) => {
+    let s; try { s = JSON.parse(ev.data); } catch { return; }
+    if (s.total === undefined) return;
+    // A finished run from before this page loaded is not shown again.
+    if (s.finished && !S.running) return;
+    showRun(s);
+  };
+}
+
+/* ---------- Tabs (narrow screens) ---------- */
+function setTab(tab, onlyNarrow) {
+  if (onlyNarrow && !matchMedia('(max-width: 899px)').matches) return;
+  $('main').dataset.tab = tab;
+  for (const b of document.querySelectorAll('nav.tabs button')) b.setAttribute('aria-selected', b.dataset.tab === tab);
+}
+for (const b of document.querySelectorAll('nav.tabs button')) b.onclick = () => setTab(b.dataset.tab);
+
+function renderAll() { renderWhere(); renderMessages(); renderPlan(); }
+
+(async function start() {
+  try {
+    const d = await api('/api/defaults');
+    S.defaults = d; S.hasToken = d.has_token;
+    $('tokenHelp').textContent = d.token_help + (d.saves_token
+      ? '\n\nA token that Discord accepts is saved, so the CLI and the terminal UI use it too. Run `discord-purge login --forget` to remove it.'
+      : '\n\nThis panel keeps a new token in memory only.');
+    $('pkg').value = d.package || '';
+    $('content').value = d.content || '';
+    $('after_date').value = d.after_date || '';
+    $('before_date').value = d.before_date || '';
+    for (const t of (d.types || '').split(',').filter(Boolean)) $('types').querySelector(`[data-type="${t}"]`)?.setAttribute('aria-pressed', 'true');
+    $('include_pinned').checked = d.include_pinned;
+    $('workers').value = d.workers; $('delay').value = d.delay; $('jitter').value = d.jitter;
+    setMode(d.package ? 'package' : 'account');
+    renderAll();
+    connectEvents();
+    if (d.package || d.has_token) loadCatalog();
+    else $('token').focus();
+  } catch (e) { fail(e); }
+})();
+</script>
+</body>
+</html>

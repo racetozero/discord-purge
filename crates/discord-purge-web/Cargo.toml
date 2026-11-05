@@ -1,0 +1,21 @@
+[package]
+name = "discord-purge-web"
+description = "Local web panel for discord-purge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+discord-purge-core.workspace = true
+futures.workspace = true
+open.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
