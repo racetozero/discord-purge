@@ -4,7 +4,7 @@
 [![Downloads](https://img.shields.io/github/downloads/racetozero/discord-purge/total)](https://github.com/racetozero/discord-purge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
-<img width="1822" height="1180" alt="image" src="https://github.com/user-attachments/assets/36e4a1fb-5d93-48a1-864e-ddf4f8cbd0e3" />
+<img width="1822" height="1180" alt="image" src="https://github.com/user-attachments/assets/c52c9439-7dc4-4edc-83ca-8add8e06b829" />
 
 Delete your own Discord messages, safely and at a pace Discord accepts.
 
