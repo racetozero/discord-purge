@@ -22,7 +22,9 @@ The first public release.
   interfaces.
 - Pause, stop, and continue a run. Completed messages are saved for each
   account, so the next run starts where the last one stopped.
-- Install on macOS, Linux, and Windows with one command. The installers verify
-  the SHA-256 checksum of each release.
+- Install on macOS, Linux, and Windows with one command, or with Homebrew. The
+  installers verify the SHA-256 checksum of each release.
+- Update to the latest release with `discord-purge update`. It verifies the
+  SHA-256 checksum of the release before it replaces the executable.
 - Release binaries for x64 and ARM64 on macOS, Linux (glibc and musl), and
   Windows. All binaries use profile-guided optimization except on Windows ARM64.
