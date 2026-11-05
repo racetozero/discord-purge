@@ -88,3 +88,36 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           gh release create "$RELEASE_TAG" --verify-tag --generate-notes artifacts/*
+
+  publish-homebrew:
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The deploy key can write only to the tap repository.
+      - uses: actions/checkout@v7
+        with:
+          repository: racetozero/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - name: Commit formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p tap/Formula
+          python3 scripts/homebrew_formula.py "$RELEASE_TAG" artifacts > tap/Formula/discord-purge.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/discord-purge.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "discord-purge $RELEASE_TAG"
+          git push

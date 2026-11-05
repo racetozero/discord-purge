@@ -101,12 +101,40 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
-def load_build_release() -> ModuleType:
-    specification = importlib.util.spec_from_file_location("build_release", ROOT / "scripts" / "build_release.py")
+def load_script(name: str) -> ModuleType:
+    specification = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     assert specification is not None and specification.loader is not None
-    build_release = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(build_release)
-    return build_release
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def load_build_release() -> ModuleType:
+    return load_script("build_release")
+
+
+class HomebrewTest(unittest.TestCase):
+    def test_each_platform_gets_its_own_archive_and_checksum(self) -> None:
+        homebrew = load_script("homebrew_formula")
+        with tempfile.TemporaryDirectory(prefix="discord-purge-formula-test-") as temporary:
+            artifacts = Path(temporary)
+            digests: dict[str, str] = {}
+            for index, target in enumerate(homebrew.TARGETS.values()):
+                digests[target] = f"{index}" * 64
+                (artifacts / f"discord-purge-{target}.tar.gz.sha256").write_text(
+                    f"{digests[target]}  discord-purge-{target}.tar.gz\n", encoding="utf-8",
+                )
+            formula: str = homebrew.formula("v1.2.3", artifacts)
+            self.assertIn('version "1.2.3"', formula)
+            self.assertNotIn("linux-gnu", formula)
+            for target, digest in digests.items():
+                url = f"https://github.com/racetozero/discord-purge/releases/download/v1.2.3/discord-purge-{target}.tar.gz"
+                self.assertIn(f'url "{url}"\n      sha256 "{digest}"', formula)
+            (artifacts / "discord-purge-x86_64-apple-darwin.tar.gz.sha256").unlink()
+            with self.assertRaises(RuntimeError):
+                homebrew.formula("v1.2.3", artifacts)
+            with self.assertRaises(RuntimeError):
+                homebrew.formula("latest", artifacts)
 
 
 class PgoTest(unittest.TestCase):

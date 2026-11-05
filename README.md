@@ -53,6 +53,21 @@ The installer selects the correct release, verifies its SHA-256 checksum, and
 installs `discord-purge` in `~/.local/bin`. Open a new terminal after
 installation.
 
+Update later with:
+
+```bash
+discord-purge update
+```
+
+Homebrew on macOS and Linux:
+
+```bash
+brew install racetozero/tap/discord-purge
+```
+
+Homebrew owns this copy, so update it with
+`brew upgrade racetozero/tap/discord-purge` instead of `discord-purge update`.
+
 ## Start in two commands
 
 Preview your data package. This needs no token, and it deletes nothing:
@@ -231,7 +246,7 @@ to Discord.
 6. Push a matching tag: `git tag v0.0.1 && git push origin v0.0.1`.
 
 The release workflow publishes the GitHub release only after all eight macOS,
-Linux, and Windows targets succeed.
+Linux, and Windows targets succeed. It then updates the Homebrew formula.
 
 ## License
 

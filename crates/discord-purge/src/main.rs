@@ -5,6 +5,8 @@
 //! a dry run; a real deletion needs `--execute` (headless) or an explicit
 //! confirmation (TUI/web).
 
+mod update;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -126,6 +128,8 @@ enum Command {
         #[arg(long)]
         forget: bool,
     },
+    /// Update to the latest release.
+    Update,
 }
 
 /// Handle `discord-purge login`: show the how-to, save a verified token, or
@@ -232,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
 
     match &cli.command {
         Some(Command::Login { token, forget }) => return do_login(token.clone(), *forget).await,
+        Some(Command::Update) => return update::run().await,
         Some(Command::Identity { check }) => {
             let path = discord_purge_core::identity::initialize().await?;
             if *check {
