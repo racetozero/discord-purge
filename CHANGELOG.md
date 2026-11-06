@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.2 - 2026-11-06
+
 ### Added
 
 - A run now shows when it is paused and when it is stopping, in the terminal UI
