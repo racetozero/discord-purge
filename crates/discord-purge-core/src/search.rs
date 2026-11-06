@@ -63,6 +63,18 @@ impl Default for DiscoverConfig {
     }
 }
 
+/// The jobs that a discovery found. `complete` is false when a search stopped on
+/// empty pages before it reached Discord's reported total, so more messages can
+/// exist.
+#[derive(Debug, Clone)]
+pub struct Discovered {
+    pub jobs: Vec<ChannelJob>,
+    pub complete: bool,
+}
+
+/// What a front end shows when a preview is not complete.
+pub const INCOMPLETE_NOTICE: &str = "Discord's search stopped early, so this count can be too low. Preview again later to find the remaining messages.";
+
 /// How many empty pages in a row to tolerate (stale index) before stopping.
 const MAX_EMPTY_PAGES: u32 = 5;
 const EMPTY_BACKOFF: f64 = 1.3;
@@ -79,7 +91,7 @@ pub async fn discover(
     client: &DiscordClient,
     config: &DiscoverConfig,
     filter: &Filter,
-) -> anyhow::Result<Vec<ChannelJob>> {
+) -> anyhow::Result<Discovered> {
     anyhow::ensure!(
         config.guild_id.is_some() || config.channel_ids.len() == 1,
         "A DM search needs exactly one channel ID, but {} were given. Search one DM at a time, or add a server ID.",
@@ -105,7 +117,7 @@ pub async fn discover(
     let mut seen = HashSet::new();
     let mut wait_count = 0usize;
 
-    loop {
+    let complete = loop {
         let params = SearchParams {
             guild_id: config.guild_id.clone(),
             channel_ids: config.channel_ids.clone(),
@@ -176,8 +188,11 @@ pub async fn discover(
         }
 
         offset += PAGE_SIZE;
-        if offset as i64 >= page.total_results || empty_pages >= MAX_EMPTY_PAGES {
-            break;
+        if offset as i64 >= page.total_results {
+            break true;
+        }
+        if empty_pages >= MAX_EMPTY_PAGES {
+            break false;
         }
         if offset > MAX_OFFSET {
             // Discord max_id is exclusive: continue from the oldest ID itself so
@@ -189,7 +204,7 @@ pub async fn discover(
         }
         let pace = (0.5 + rand::random::<f64>()) * EMPTY_BACKOFF.powi(empty_pages as i32);
         tokio::time::sleep(config.search_delay.mul_f64(pace)).await;
-    }
+    };
 
     let jobs = by_channel
         .into_iter()
@@ -200,5 +215,5 @@ pub async fn discover(
             verified: true,
         })
         .collect();
-    Ok(jobs)
+    Ok(Discovered { jobs, complete })
 }

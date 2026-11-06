@@ -170,7 +170,19 @@ DISCORD_TOKEN=... discord-purge --package package.zip --no-tui --execute
 ```
 
 Ctrl-C stops the run and writes its report. Use `--report PATH` to save the
-report.
+report. `--execute` and `--report` work only with `--no-tui`.
+
+A run ends with these counts:
+
+| Count      | Meaning                                                         |
+| ---------- | --------------------------------------------------------------- |
+| `deleted`  | The message is gone.                                            |
+| `skipped`  | No retry can delete it: a system message or a message you keep. |
+| `deferred` | A later run can delete it: access was lost or limits continued. |
+| `failed`   | Discord returned an error. Read the report, then retry.         |
+
+The command exits with an error when you stop the run, when the run fails, or
+when `deferred` or `failed` messages remain.
 
 ## Speed and saved progress
 

@@ -8,7 +8,7 @@ use axum::{
 };
 use discord_purge_core::{
     api::DiscordClient,
-    engine::{ChannelJob, Engine, EngineConfig, Stats},
+    engine::{ChannelJob, Engine, EngineConfig, RunPhase, Stats},
     filter::{Filter, Kind},
     search::{self, DiscoverConfig},
 };
@@ -16,10 +16,13 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod support;
 
 struct Mock {
     mode: &'static str,
+    base: String,
     calls: AtomicUsize,
     me_calls: AtomicUsize,
     deleted: Mutex<Vec<String>>,
@@ -49,6 +52,14 @@ async fn remove(
     if st.mode == "unauthorized" {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    if st.mode == "bucket" && n == 0 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("x-ratelimit-scope", "user"), ("retry-after", "0.5")],
+            Json(json!({"retry_after":0.5,"global":false})),
+        )
+            .into_response();
+    }
     if st.mode == "stop" || (st.mode == "collapse" && n < 2) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -72,6 +83,9 @@ async fn search_page(
 ) -> Response {
     let mut requests = st.searches.lock().unwrap();
     requests.push(query.clone());
+    if st.mode == "stale" {
+        return Json(json!({"total_results":1000,"messages":[]})).into_response();
+    }
     if st.mode == "deep" {
         // 10,050 results: the first 400 pages fill the offset window, then
         // one more result remains below the oldest ID.
@@ -101,8 +115,11 @@ async fn search_page(
     Json(page).into_response()
 }
 async fn server(mode: &'static str) -> (DiscordClient, Arc<Mock>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
     let st = Arc::new(Mock {
         mode,
+        base: base.clone(),
         calls: AtomicUsize::new(0),
         me_calls: AtomicUsize::new(0),
         deleted: Mutex::new(Vec::new()),
@@ -124,8 +141,6 @@ async fn server(mode: &'static str) -> (DiscordClient, Arc<Mock>, tokio::task::J
         .route("/v9/channels/{channel}/messages", get(inspect))
         .route("/v9/channels/{channel}/messages/search", get(search_page))
         .with_state(st.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -154,13 +169,23 @@ async fn all_channels_finish_after_concurrency_drops() {
     let (client, st, server) = server("collapse").await;
     let jobs = (1..=6).map(|n| job(n, &[1, 2])).collect();
     let stats = Stats::new(12, 3);
+    let run = support::confirmed(&client, jobs).await;
     let (engine, _) = Engine::new(config(3), client, stats.clone());
-    tokio::time::timeout(Duration::from_secs(6), engine.run(jobs, |_| Ok(())))
+    tokio::time::timeout(Duration::from_secs(6), engine.run(run, |_| Ok(())))
         .await
         .expect("all queued channels must finish after collapse");
     assert_eq!(stats.snapshot().active_limit, 1);
     assert_eq!(stats.snapshot().deleted, 12);
     assert_eq!(st.deleted.lock().unwrap().len(), 12);
+    // The notice must survive later status lines and reach the report.
+    let directory = tempfile::tempdir().unwrap();
+    let report = directory.path().join("report.txt");
+    discord_purge_core::resume::write_report("test", &stats.snapshot(), Some(&report)).unwrap();
+    assert!(
+        std::fs::read_to_string(&report)
+            .unwrap()
+            .contains("one request at a time")
+    );
     server.abort();
 }
 
@@ -168,10 +193,15 @@ async fn all_channels_finish_after_concurrency_drops() {
 async fn invalid_token_stops_further_deletes() {
     let (client, st, server) = server("unauthorized").await;
     let stats = Stats::new(3, 1);
+    let run = support::confirmed(&client, vec![job(1, &[1, 2, 3])]).await;
     let (engine, _) = Engine::new(config(1), client, stats.clone());
-    engine.run(vec![job(1, &[1, 2, 3])], |_| Ok(())).await;
+    engine.run(run, |_| Ok(())).await;
     assert_eq!(st.calls.load(Ordering::SeqCst), 1);
-    assert!(stats.snapshot().aborted);
+    let phase = stats.snapshot().phase;
+    assert!(
+        matches!(&phase, RunPhase::Aborted(reason) if reason.contains("401")),
+        "a failure must end as aborted and name its cause, but the phase is {phase:?}"
+    );
     assert_eq!(stats.snapshot().failed, 1);
     server.abort();
 }
@@ -184,14 +214,21 @@ async fn author_and_pin_checks_block_unreviewed_deletion() {
     let completed = Arc::new(Mutex::new(Vec::new()));
     let recorded = completed.clone();
     engine
-        .run(vec![job(1, &[201, 202, 203])], move |key| {
-            recorded.lock().unwrap().push(key.to_string());
-            Ok(())
-        })
+        .run(
+            support::confirmed(&client, vec![job(1, &[201, 202, 203])]).await,
+            move |key| {
+                recorded.lock().unwrap().push(key.to_string());
+                Ok(())
+            },
+        )
         .await;
     assert_eq!(*st.deleted.lock().unwrap(), vec!["203"]);
     assert_eq!(*completed.lock().unwrap(), vec!["203"]);
     assert_eq!(stats.snapshot().skipped, 2);
+    assert!(
+        stats.snapshot().complete(),
+        "protected messages need no retry"
+    );
     let outcome = client
         .include_pinned(true)
         .delete_message("1", "202", false)
@@ -208,9 +245,10 @@ async fn author_and_pin_checks_block_unreviewed_deletion() {
 async fn stop_interrupts_a_long_rate_limit_wait() {
     let (client, st, server) = server("stop").await;
     let stats = Stats::new(2, 1);
+    let run = support::confirmed(&client, vec![job(1, &[1, 2])]).await;
     let (engine, controls) = Engine::new(config(1), client, stats.clone());
     let task = tokio::spawn(async move {
-        engine.run(vec![job(1, &[1, 2])], |_| Ok(())).await;
+        engine.run(run, |_| Ok(())).await;
     });
     st.seen.notified().await;
     controls.stop();
@@ -219,8 +257,61 @@ async fn stop_interrupts_a_long_rate_limit_wait() {
         .unwrap()
         .unwrap();
     assert_eq!(st.calls.load(Ordering::SeqCst), 1);
-    assert!(stats.snapshot().aborted);
+    assert_eq!(
+        stats.snapshot().phase,
+        RunPhase::Stopped,
+        "a user stop is not a failure"
+    );
     assert_eq!(stats.snapshot().processed, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_pause_is_visible_holds_requests_and_a_stop_can_end_it() {
+    let (client, st, server) = server("normal").await;
+    let stats = Stats::new(2, 1);
+    let run = support::confirmed(&client, vec![job(1, &[1, 2])]).await;
+    let (engine, controls) = Engine::new(config(1), client, stats.clone());
+    controls.pause();
+    let task = tokio::spawn(async move {
+        engine.run(run, |_| Ok(())).await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(stats.snapshot().phase, RunPhase::Paused);
+    assert_eq!(st.calls.load(Ordering::SeqCst), 0);
+    controls.stop();
+    controls.resume();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stats.snapshot().phase,
+        RunPhase::Stopped,
+        "a late resume must not undo the stop"
+    );
+    assert_eq!(st.calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn clients_of_one_token_share_discord_rate_limits() {
+    let (first, st, server) = server("bucket").await;
+    let second = DiscordClient::with_base("test-token", st.base.clone()).unwrap();
+    assert!(matches!(
+        first.delete_message("1", "5", true).await,
+        discord_purge_core::api::DeleteOutcome::RateLimited { .. }
+    ));
+    let start = Instant::now();
+    assert!(matches!(
+        second.delete_message("1", "6", true).await,
+        discord_purge_core::api::DeleteOutcome::Deleted
+    ));
+    assert!(
+        start.elapsed() >= Duration::from_millis(350),
+        "the second client ignored a 0.5 second bucket wait: {:?}",
+        start.elapsed()
+    );
     server.abort();
 }
 
@@ -228,12 +319,14 @@ async fn stop_interrupts_a_long_rate_limit_wait() {
 async fn resume_write_error_stops_new_deletes() {
     let (client, st, server) = server("normal").await;
     let stats = Stats::new(2, 1);
+    let run = support::confirmed(&client, vec![job(1, &[1, 2])]).await;
     let (engine, _) = Engine::new(config(1), client, stats.clone());
-    engine
-        .run(vec![job(1, &[1, 2])], |_| anyhow::bail!("disk full"))
-        .await;
+    engine.run(run, |_| anyhow::bail!("disk full")).await;
     assert_eq!(st.calls.load(Ordering::SeqCst), 1);
-    assert!(stats.snapshot().aborted);
+    assert!(matches!(
+        &stats.snapshot().phase,
+        RunPhase::Aborted(reason) if reason.contains("disk full")
+    ));
     assert!(
         stats
             .snapshot()
@@ -258,9 +351,10 @@ async fn search_applies_author_hit_attachment_and_local_regex_filters() {
         types: Kind::IMAGE,
         ..Default::default()
     };
-    let jobs = search::discover(&client, &cfg, &filter).await.unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].items, vec![102, 100]);
+    let found = search::discover(&client, &cfg, &filter).await.unwrap();
+    assert!(found.complete, "this walk reached Discord's reported total");
+    assert_eq!(found.jobs.len(), 1);
+    assert_eq!(found.jobs[0].items, vec![102, 100]);
     let requests = st.searches.lock().unwrap();
     // A short first page does not end the walk; total_results does.
     assert_eq!(requests.len(), 2);
@@ -282,16 +376,37 @@ async fn search_continues_below_the_oldest_id_past_the_offset_limit() {
         search_delay: Duration::ZERO,
         ..Default::default()
     };
-    let jobs = search::discover(&client, &cfg, &Filter::default())
+    let found = search::discover(&client, &cfg, &Filter::default())
         .await
         .unwrap();
-    assert_eq!(jobs[0].items.len(), 401);
+    assert!(found.complete);
+    assert_eq!(found.jobs[0].items.len(), 401);
     let requests = st.searches.lock().unwrap();
     assert_eq!(requests[399]["offset"], "9975");
     let last = requests.last().unwrap();
     assert_eq!(last["offset"], "0");
     assert_eq!(last["max_id"], "90025");
     drop(requests);
+    server.abort();
+}
+
+#[tokio::test]
+async fn search_that_stops_on_empty_pages_reports_a_partial_result() {
+    let (client, st, server) = server("stale").await;
+    let cfg = DiscoverConfig {
+        author_id: "7".into(),
+        channel_ids: vec!["10".into()],
+        search_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let found = search::discover(&client, &cfg, &Filter::default())
+        .await
+        .unwrap();
+    assert!(
+        !found.complete,
+        "Discord reported 1000 results, and the walk read none of them"
+    );
+    assert_eq!(st.searches.lock().unwrap().len(), 5);
     server.abort();
 }
 
@@ -333,6 +448,32 @@ async fn package_preview_is_offline_even_with_a_token() {
         "package preview must not contact Discord"
     );
     server.abort();
+}
+
+#[test]
+fn cli_refuses_plain_run_flags_that_its_mode_would_ignore() {
+    let state = tempfile::tempdir().unwrap();
+    for flags in [
+        &["--execute"][..],
+        &["--report=report.txt"][..],
+        &["--web", "--no-tui"][..],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_discord-purge"))
+            .args(flags)
+            .env_remove("DISCORD_TOKEN")
+            .env("DISCORD_PURGE_STATE_DIR", state.path())
+            .env("DISCORD_PURGE_IDENTITY_DIR", state.path())
+            .env("DISCORD_PURGE_NO_OPEN", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{flags:?} must be refused");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--no-tui"),
+            "{flags:?} must say how to correct it: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -11,7 +11,7 @@ use crate::api::{BrowseMessage, Channel, CurrentUser, DiscordClient, Guild, is_d
 use crate::engine::ChannelJob;
 use crate::filter::{Filter, classify, cmp_snowflake};
 use crate::package::{LoadedPackage, PkgMessage};
-use crate::search::{DiscoverConfig, MAX_CHANNELS, Target};
+use crate::search::{DiscoverConfig, Discovered, MAX_CHANNELS, Target};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct MessageRef {
@@ -309,7 +309,7 @@ pub async fn discover(
     package: Option<&Path>,
     account: &str,
     filter: &Filter,
-) -> anyhow::Result<Vec<ChannelJob>> {
+) -> anyhow::Result<Discovered> {
     selection.validate()?;
     let refs: &[MessageRef] = match &selection.range {
         MessageRange::Older { anchor } | MessageRange::Newer { anchor } => {
@@ -349,7 +349,7 @@ pub async fn discover(
             found.len() == required.len(),
             "A selected message is outside the selected package channels. Choose the message from the current scope and retry."
         );
-        return Ok(package
+        let jobs = package
             .channels
             .into_iter()
             .filter(|c| selection.contains_channel(&package_channel(c)))
@@ -369,7 +369,11 @@ pub async fn discover(
                     verified: false,
                 })
             })
-            .collect());
+            .collect();
+        return Ok(Discovered {
+            jobs,
+            complete: true,
+        });
     }
     let mut channel_cache = BTreeMap::new();
     for reference in refs {
@@ -433,7 +437,10 @@ pub async fn discover(
                     )
                 })?);
         }
-        return Ok(jobs.into_values().collect());
+        return Ok(Discovered {
+            jobs: jobs.into_values().collect(),
+            complete: true,
+        });
     }
     if let MessageRange::Older { anchor } | MessageRange::Newer { anchor } = &selection.range {
         client
@@ -506,6 +513,7 @@ pub async fn discover(
         .chain(dms.into_iter().map(|c| (None, vec![c.to_string()])));
     let mut seen_messages = HashSet::new();
     let mut jobs: BTreeMap<String, ChannelJob> = BTreeMap::new();
+    let mut complete = true;
     for (index, (guild_id, channel_ids)) in searches.enumerate() {
         let config = DiscoverConfig {
             author_id: account.into(),
@@ -520,7 +528,9 @@ pub async fn discover(
             let pace = 0.5 + rand::random::<f64>();
             tokio::time::sleep(config.search_delay.mul_f64(pace)).await;
         }
-        for mut job in crate::search::discover(client, &config, &filter).await? {
+        let found = crate::search::discover(client, &config, &filter).await?;
+        complete &= found.complete;
+        for mut job in found.jobs {
             ensure!(
                 config.channel_ids.is_empty() || config.channel_ids.contains(&job.channel_id),
                 "Discord returned messages outside the selected channel. Refresh the scope and preview again."
@@ -541,5 +551,8 @@ pub async fn discover(
                 .extend(job.items);
         }
     }
-    Ok(jobs.into_values().collect())
+    Ok(Discovered {
+        jobs: jobs.into_values().collect(),
+        complete,
+    })
 }

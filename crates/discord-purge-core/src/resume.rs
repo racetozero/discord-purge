@@ -195,24 +195,25 @@ pub fn write_report(
     body.push_str(&format!("discord-purge report\nAccount: {account_label}\n"));
     body.push_str(&format!(
         "Status: {}\n",
-        if snapshot.aborted {
-            "aborted"
-        } else if snapshot.finished {
-            "finished"
-        } else {
-            "stopped"
-        }
+        snapshot.phase.label().to_lowercase()
     ));
+    if let Some(reason) = snapshot.phase.reason() {
+        body.push_str(&format!("Reason: {reason}\n"));
+    }
     body.push_str(&format!(
-        "Elapsed: {}\nTotal: {}  Deleted: {}  Skipped: {}  Failed: {}\n",
+        "Elapsed: {}\nTotal: {}  Deleted: {}  Skipped: {}  Deferred: {}  Failed: {}\n",
         format_duration(snapshot.elapsed),
         snapshot.total,
         snapshot.deleted,
         snapshot.skipped,
+        snapshot.deferred,
         snapshot.failed
     ));
     if !snapshot.status.is_empty() {
         body.push_str(&format!("Last status: {}\n", snapshot.status));
+    }
+    if let Some(notice) = snapshot.limit_notice() {
+        body.push_str(&format!("Rate limits: {notice}\n"));
     }
     if !snapshot.forbidden.is_empty() {
         body.push_str("\nChannel/system responses, grouped by channel (response counts):\n");

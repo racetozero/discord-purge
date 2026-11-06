@@ -19,7 +19,9 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use discord_purge_core::api::DiscordClient;
-use discord_purge_core::engine::{ChannelJob, Engine, Stats};
+use discord_purge_core::engine::{ChannelJob, Engine, RunPhase, Stats};
+
+mod support;
 
 #[derive(Default)]
 struct MockState {
@@ -115,12 +117,13 @@ async fn deletes_all_handling_429_404_403() {
         delay: Duration::from_millis(1),
         jitter: 0.0,
     };
+    let run = support::confirmed(&client, jobs).await;
     let (engine, _controls) = Engine::new(cfg, client, stats.clone());
 
     let done: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let done2 = done.clone();
     engine
-        .run(jobs, move |k| {
+        .run(run, move |k| {
             done2.lock().unwrap().insert(k.to_string());
             Ok(())
         })
@@ -131,7 +134,21 @@ async fn deletes_all_handling_429_404_403() {
     assert_eq!(snap.deleted, 4, "four messages should be confirmed gone");
     assert_eq!(snap.skipped, 1, "the system message should be skipped");
     assert_eq!(snap.failed, 0, "nothing should fail");
-    assert!(snap.finished);
+    assert_eq!(snap.phase, RunPhase::Completed);
+    assert_eq!(
+        snap.limit_notice(),
+        None,
+        "a per-user 429 must not report a reduced limit"
+    );
+    assert!(
+        snap.complete(),
+        "a system message needs no retry, so the run is complete"
+    );
+    assert!(
+        snap.status.is_empty(),
+        "the 429 wait ended, but the status still says {:?}",
+        snap.status
+    );
 
     // Resume keys: deleted + already-gone + system (undeletable forever) = all 5.
     let done = done.lock().unwrap();

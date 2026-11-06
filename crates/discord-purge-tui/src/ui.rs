@@ -7,7 +7,10 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Focus, Modal, Range, Row, Screen, TYPES, message_ref};
+use crate::app::{
+    App, FilterField, Focus, HistoryLoad, Modal, Range, Row, Screen, SourceField, TYPES,
+    message_ref,
+};
 
 /// Highlighter amber marks what is selected; red is only for deletion.
 const MARK: Color = Color::Rgb(242, 183, 5);
@@ -309,13 +312,17 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &App) {
     };
     let title = format!(" Messages · {} ", clean(&history.channel.label()));
     if history.messages.is_empty() {
-        let text = if history.loading {
-            "Loading messages…"
-        } else {
-            "This channel has no messages to show."
+        let text = match &history.load {
+            HistoryLoad::Loading => "Loading messages…".to_string(),
+            HistoryLoad::Failed(reason) => format!(
+                "Cannot load these messages: {} Press Enter to retry.",
+                clean(reason)
+            ),
+            HistoryLoad::Idle => "This channel has no messages to show.".to_string(),
         };
         frame.render_widget(
             Paragraph::new(text)
+                .wrap(Wrap { trim: true })
                 .style(Style::default().fg(MUTED))
                 .block(pane(title, focused)),
             area,
@@ -383,7 +390,7 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     items.push(ListItem::new(Span::styled(
-        if history.loading {
+        if history.load == HistoryLoad::Loading {
             "  Loading older messages…"
         } else if history.more {
             "  ↓ Move down to load older messages"
@@ -495,7 +502,11 @@ fn draw_plan(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Style::default().fg(MARK).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Press d to delete them."),
+            Span::raw(if run.complete {
+                "Press d to delete them."
+            } else {
+                "The count can be too low. Press d to delete them."
+            }),
         ])
     } else if app.preview.is_some() {
         Line::styled(
@@ -566,14 +577,9 @@ fn draw_run(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
     } else {
         0.0
     };
-    let title = match (app.screen, snapshot.aborted) {
-        (Screen::Done, true) => " Stopped ",
-        (Screen::Done, false) => " Finished ",
-        _ => " Deleting ",
-    };
     frame.render_widget(
         Gauge::default()
-            .block(pane(title.into(), true))
+            .block(pane(format!(" {} ", snapshot.phase.label()), true))
             .gauge_style(Style::default().fg(MARK).bg(Color::Rgb(40, 40, 40)))
             .ratio(ratio)
             .label(format!("{} of {}", snapshot.processed, snapshot.total)),
@@ -596,6 +602,15 @@ fn draw_run(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
         number(snapshot.deleted.to_string(), "deleted", MARK),
         number(snapshot.skipped.to_string(), "skipped", Color::Reset),
         number(
+            snapshot.deferred.to_string(),
+            "deferred",
+            if snapshot.deferred > 0 {
+                DANGER
+            } else {
+                Color::Reset
+            },
+        ),
+        number(
             snapshot.failed.to_string(),
             "failed",
             if snapshot.failed > 0 {
@@ -612,7 +627,7 @@ fn draw_run(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
     .flatten()
     .collect();
     frame.render_widget(Line::from(spans), numbers);
-    let mut text = clean(&snapshot.status);
+    let mut text = clean(snapshot.phase.reason().unwrap_or(&snapshot.status));
     if app.screen == Screen::Done {
         text = format!("{text}  Report: {}", app.report);
     }
@@ -623,20 +638,20 @@ fn draw_run(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
         status,
     );
     let mut lines: Vec<Line> = snapshot
-        .workers
-        .iter()
-        .filter(|w| w.active)
-        .map(|w| {
-            Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(MARK)),
-                Span::raw(clean(&w.channel)),
-                Span::styled(
-                    format!("  {}/{}", w.done, w.total),
-                    Style::default().fg(MUTED),
-                ),
-            ])
-        })
+        .limit_notice()
+        .map(|notice| Line::styled(notice, Style::default().fg(MARK)))
+        .into_iter()
         .collect();
+    lines.extend(snapshot.workers.iter().filter(|w| w.active).map(|w| {
+        Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(MARK)),
+            Span::raw(clean(&w.channel)),
+            Span::styled(
+                format!("  {}/{}", w.done, w.total),
+                Style::default().fg(MUTED),
+            ),
+        ])
+    }));
     for error in snapshot.errors.iter().rev().take(6) {
         lines.push(Line::styled(
             format!("! {}", clean(error)),
@@ -778,6 +793,12 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                         Style::default().fg(MUTED),
                     ));
                 }
+                if !run.complete {
+                    lines.push(Line::styled(
+                        discord_purge_core::search::INCOMPLETE_NOTICE,
+                        Style::default().fg(MARK),
+                    ));
+                }
                 lines.push(Line::from(""));
                 let shown = 12usize;
                 let start = cursor.saturating_sub(shown - 1);
@@ -815,7 +836,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
             let token = if form.token.is_empty() && app.token.is_some() {
                 Span::styled("saved token in use", Style::default().fg(MUTED))
             } else {
-                input(&"•".repeat(form.token.chars().count()), form.field == 1)
+                input(
+                    &"•".repeat(form.token.chars().count()),
+                    form.field == SourceField::Token,
+                )
             };
             let mut lines = Vec::new();
             if form.for_delete {
@@ -823,19 +847,20 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     "Deletion needs your account token. The preview stays as it is.",
                 ));
             } else {
-                let mut source = field_line(form.field == 0, "Source", Span::from(""));
+                let mut source =
+                    field_line(form.field == SourceField::Kind, "Source", Span::from(""));
                 source.spans.extend([
                     mode(!form.package_mode, "Discord account"),
                     mode(form.package_mode, "Data package"),
                 ]);
                 lines.push(source);
             }
-            lines.push(field_line(form.field == 1, "Token", token));
+            lines.push(field_line(form.field == SourceField::Token, "Token", token));
             if !form.for_delete {
                 lines.push(field_line(
-                    form.field == 2,
+                    form.field == SourceField::Package,
                     "Package path",
-                    input(&form.package, form.field == 2),
+                    input(&form.package, form.field == SourceField::Package),
                 ));
             }
             if let Some(error) = &form.error {
@@ -848,12 +873,16 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     .map(|l| Line::styled(l.to_string(), Style::default().fg(MUTED))),
             );
             lines.push(Line::from(""));
-            lines.push(hints(&[
-                ("↑↓", "field"),
-                ("←→", "source"),
-                ("Enter", "continue"),
-                ("Esc", "close"),
-            ]));
+            lines.push(if form.for_delete {
+                hints(&[("Enter", "continue"), ("Esc", "close")])
+            } else {
+                hints(&[
+                    ("↑↓", "field"),
+                    ("←→", "source"),
+                    ("Enter", "continue"),
+                    ("Esc", "close"),
+                ])
+            });
             (" Source ".into(), 80, lines, false)
         }
         Modal::Filters(form) => {
@@ -866,7 +895,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     } else {
                         Style::default().fg(MUTED)
                     };
-                    if form.field == 1 && form.type_cursor == index {
+                    if form.field == FilterField::Types && form.type_cursor == index {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
                     Span::styled(
@@ -877,23 +906,23 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                 .collect();
             let mut lines = vec![
                 field_line(
-                    form.field == 0,
+                    form.field == FilterField::Content,
                     "Text",
-                    input(&form.content, form.field == 0),
+                    input(&form.content, form.field == FilterField::Content),
                 ),
-                field_line(form.field == 1, "Types", Span::from("")),
+                field_line(form.field == FilterField::Types, "Types", Span::from("")),
                 field_line(
-                    form.field == 2,
+                    form.field == FilterField::After,
                     "From date",
-                    input(&form.after, form.field == 2),
+                    input(&form.after, form.field == FilterField::After),
                 ),
                 field_line(
-                    form.field == 3,
+                    form.field == FilterField::Before,
                     "To date",
-                    input(&form.before, form.field == 3),
+                    input(&form.before, form.field == FilterField::Before),
                 ),
                 field_line(
-                    form.field == 4,
+                    form.field == FilterField::Pinned,
                     "Pinned",
                     Span::raw(if form.pinned {
                         "[x] delete pinned messages too"
@@ -902,19 +931,19 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     }),
                 ),
                 field_line(
-                    form.field == 5,
+                    form.field == FilterField::Workers,
                     "Workers",
-                    input(&form.workers, form.field == 5),
+                    input(&form.workers, form.field == FilterField::Workers),
                 ),
                 field_line(
-                    form.field == 6,
+                    form.field == FilterField::Delay,
                     "Delay (s)",
-                    input(&form.delay, form.field == 6),
+                    input(&form.delay, form.field == FilterField::Delay),
                 ),
                 field_line(
-                    form.field == 7,
+                    form.field == FilterField::Jitter,
                     "Jitter",
-                    input(&form.jitter, form.field == 7),
+                    input(&form.jitter, form.field == FilterField::Jitter),
                 ),
             ];
             lines[1].spans.extend(chips);
@@ -998,9 +1027,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Screen;
+    use crate::app::{History, Screen};
     use discord_purge_core::Options;
-    use discord_purge_core::engine::{ForbiddenStat, Stats};
+    use discord_purge_core::api::Channel;
+    use discord_purge_core::engine::{ForbiddenStat, RunPhase, Stats};
     use discord_purge_core::filter::Filter;
 
     fn render(app: &App, width: u16, height: u16) -> String {
@@ -1070,5 +1100,74 @@ mod tests {
             rendered.contains("Only bots can use this endpoint"),
             "a forbidden response must be visible even with an empty status string"
         );
+    }
+
+    #[test]
+    fn running_screen_shows_a_pause_and_an_abort_reason() {
+        let mut app = empty();
+        app.screen = Screen::Running;
+        let stats = Stats::new(1, 1);
+        app.stats = Some(stats.clone());
+        let mut snapshot = stats.snapshot();
+        snapshot.phase = RunPhase::Paused;
+        let rendered = |snapshot: &Snapshot| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| draw_run(frame, frame.area(), &app, snapshot))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(rendered(&snapshot).contains("Paused"));
+        snapshot.phase = RunPhase::Aborted("Discord answered 401".into());
+        let screen = rendered(&snapshot);
+        assert!(screen.contains("Aborted") && screen.contains("Discord answered 401"));
+    }
+
+    #[test]
+    fn running_screen_shows_a_reduced_request_limit() {
+        let mut app = empty();
+        app.screen = Screen::Running;
+        app.stats = Some(Stats::new(1, 4));
+        let mut snapshot = app.stats.as_ref().unwrap().snapshot();
+        snapshot.active_limit = 1;
+        // Wide enough that the notice does not wrap inside the checked words.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_run(frame, frame.area(), &app, &snapshot))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("one request at a time"));
+    }
+
+    #[test]
+    fn a_failed_first_history_load_shows_the_reason_not_an_empty_channel() {
+        let mut app = empty();
+        app.history = Some(History {
+            channel: Channel {
+                id: "1".into(),
+                name: Some("general".into()),
+                kind: 0,
+                guild_id: None,
+                recipients: Vec::new(),
+            },
+            messages: Vec::new(),
+            more: false,
+            load: HistoryLoad::Failed("Missing Access.".into()),
+            cursor: 0,
+        });
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("Missing Access") && !screen.contains("no messages to show"));
     }
 }

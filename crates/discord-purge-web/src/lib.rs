@@ -23,12 +23,16 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use discord_purge_core::api::DiscordClient;
-use discord_purge_core::engine::{Controls, Engine, EngineConfig, Snapshot, Stats};
+use discord_purge_core::api::{DEFAULT_BASE, DiscordClient, TokenRejected};
+use discord_purge_core::engine::{Controls, Engine, EngineConfig, Stats};
+use discord_purge_core::search::INCOMPLETE_NOTICE;
 use discord_purge_core::selection::{self, Selection};
 use discord_purge_core::{Options, PreparedRun, Source, prepare, resume};
 
 struct Live {
+    /// Names this run in `/api/run` and in each event, so the page can tell its
+    /// own run from an earlier one.
+    id: String,
     stats: Arc<Stats>,
     controls: Controls,
     account: String,
@@ -41,6 +45,7 @@ struct AppState {
     run_lock: Mutex<()>,
     session: String,
     host: String,
+    api_base: String,
 }
 
 struct StoredPreview {
@@ -56,6 +61,19 @@ impl AppState {
             .await
             .as_ref()
             .is_some_and(|run| !run.stats.is_finished())
+    }
+
+    /// Allow one preview or run preparation at a time, and none during a run.
+    async fn admit(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, ApiError> {
+        let Ok(guard) = self.run_lock.try_lock() else {
+            return Err(
+                "A preview or run is being prepared. Wait for it to finish and retry.".into(),
+            );
+        };
+        if self.run_active().await {
+            return Err("A run is active. Stop it or wait for completion before you retry.".into());
+        }
+        Ok(guard)
     }
 
     /// The request's token, then `--token`, then the saved token. The saved
@@ -99,6 +117,7 @@ pub async fn serve(config: Options, port: u16) -> anyhow::Result<()> {
         run_lock: Mutex::new(()),
         session: session.clone(),
         host: format!("127.0.0.1:{port}"),
+        api_base: DEFAULT_BASE.into(),
     });
 
     let app = router(state);
@@ -256,17 +275,34 @@ async fn browse_source(
     );
     let token = state.token(&request.token).unwrap_or_default();
     Ok((
-        DiscordClient::new(token.clone())?,
+        DiscordClient::with_base(token.clone(), state.api_base.clone())?,
         state.package(&request.package),
         token,
     ))
 }
 
-struct ApiError(String);
+struct ApiError {
+    message: String,
+    token_rejected: bool,
+}
 
 impl<E: std::fmt::Display> From<E> for ApiError {
     fn from(error: E) -> Self {
-        Self(error.to_string())
+        Self {
+            message: error.to_string(),
+            token_rejected: false,
+        }
+    }
+}
+
+impl ApiError {
+    /// An error from a request that used the token. The page must know about a
+    /// rejection, so it stops offering deletion with that token.
+    fn from_account(error: anyhow::Error) -> Self {
+        Self {
+            token_rejected: error.is::<TokenRejected>(),
+            message: error.to_string(),
+        }
     }
 }
 
@@ -274,7 +310,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": self.0 })),
+            Json(json!({
+                "ok": false, "error": self.message, "token_rejected": self.token_rejected,
+            })),
         )
             .into_response()
     }
@@ -287,7 +325,9 @@ async fn browse_catalog(
     Json(request): Json<BrowseReq>,
 ) -> ApiResult {
     let (client, package, token) = browse_source(&state, &request).await?;
-    let catalog = selection::catalog(&client, package.as_deref()).await?;
+    let catalog = selection::catalog(&client, package.as_deref())
+        .await
+        .map_err(ApiError::from_account)?;
     // Without a package, the catalog came from Discord, so it accepted the token.
     let saved = package.is_none() && state.remember(&token);
     Ok(Json(json!({
@@ -330,7 +370,10 @@ async fn preview(State(state): State<Arc<AppState>>, Json(request): Json<Preview
     // A dry-run preview needs no token for a package (nothing is deleted and no
     // account is required), matching the headless offline preview. The run
     // endpoint still requires a token for a real deletion.
-    let client = DiscordClient::new(state.token(&request.token).unwrap_or_default())?;
+    let client = DiscordClient::with_base(
+        state.token(&request.token).unwrap_or_default(),
+        state.api_base.clone(),
+    )?;
     let include_pinned = request
         .include_pinned
         .unwrap_or(state.defaults.include_pinned);
@@ -350,17 +393,14 @@ async fn preview(State(state): State<Arc<AppState>>, Json(request): Json<Preview
         request.after_date.as_deref(),
         request.before_date.as_deref(),
     )?;
-    let Ok(_guard) = state.run_lock.try_lock() else {
-        return Err("A preview or run is being prepared. Wait for it to finish and retry.".into());
-    };
-    if state.run_active().await {
-        return Err("A run is active. Stop it or wait before preparing another preview.".into());
-    }
+    let _guard = state.admit().await?;
     let scope = match &source {
         Source::Selected { selection, .. } => selection.description(),
         _ => "All matching messages in the specified source".into(),
     };
-    let run = prepare(&client, &source, &filter).await?;
+    let run = prepare(&client, &source, &filter)
+        .await
+        .map_err(ApiError::from_account)?;
     let preview_id = format!("{:032x}", rand::thread_rng().r#gen::<u128>());
     let channels: Vec<_> = run
         .jobs
@@ -375,6 +415,7 @@ async fn preview(State(state): State<Arc<AppState>>, Json(request): Json<Preview
         "channels": channels,
         "preview_id": preview_id,
         "scope": scope,
+        "incomplete": (!run.complete).then_some(INCOMPLETE_NOTICE),
     }))
     .into_response();
     *state.preview.lock().await = Some(StoredPreview {
@@ -397,12 +438,7 @@ struct RunReq {
 }
 
 async fn run_handler(State(state): State<Arc<AppState>>, Json(request): Json<RunReq>) -> ApiResult {
-    let Ok(_guard) = state.run_lock.try_lock() else {
-        return Err("A run is being prepared. Wait for it to start before you retry.".into());
-    };
-    if state.run_active().await {
-        return Err("A run is active. Stop it or wait for completion before you retry.".into());
-    }
+    let _guard = state.admit().await?;
     if !request.execute {
         return Err(
             "You did not confirm deletion. Complete a preview and set execute to true.".into(),
@@ -417,7 +453,7 @@ async fn run_handler(State(state): State<Arc<AppState>>, Json(request): Json<Run
     let token = state
         .token(&request.token)
         .ok_or("You did not supply a token. Enter your account token before you start deletion.")?;
-    let client = DiscordClient::new(token.clone())?;
+    let client = DiscordClient::with_base(token.clone(), state.api_base.clone())?;
     // Hold the preview until admission completes. A failed check does not consume it.
     let mut preview = state.preview.lock().await;
     let stored = preview
@@ -425,27 +461,37 @@ async fn run_handler(State(state): State<Arc<AppState>>, Json(request): Json<Run
         .filter(|stored| stored.id == request.preview_id)
         .ok_or("The preview is missing or has changed. Complete a new preview before deletion.")?;
     let client = client.include_pinned(stored.include_pinned);
-    let run = stored.run.confirm(&client).await?;
+    let run = stored
+        .run
+        .confirm(&client)
+        .await
+        .map_err(ApiError::from_account)?;
     state.remember(&token);
     let log = resume::ResumeLog::open(&run.account_id).map_err(|error| {
         format!("Cannot open the resume log: {error}. Check state directory permissions and retry.")
     })?;
     preview.take();
-    let total = run.total;
+    let (total, already_done) = (run.total, run.already_done);
+    let account = run.account_label.clone();
+    let run_id = format!("{:032x}", rand::thread_rng().r#gen::<u128>());
     let stats = Stats::new(total, settings.workers);
     let (engine, controls) = Engine::new(settings, client, stats.clone());
     *state.live.lock().await = Some(Live {
+        id: run_id.clone(),
         stats: stats.clone(),
         controls,
-        account: run.account_label.clone(),
+        account: account.clone(),
     });
     tokio::spawn(async move {
-        engine.run(run.jobs, move |key| log.record(key)).await;
-        if let Err(error) = resume::write_report(&run.account_label, &stats.snapshot(), None) {
+        engine.run(run, move |key| log.record(key)).await;
+        if let Err(error) = resume::write_report(&account, &stats.snapshot(), None) {
             eprintln!("Cannot write the report: {error}. Check state directory permissions.");
         }
     });
-    Ok(Json(json!({ "ok": true, "total": total })).into_response())
+    Ok(Json(json!({
+        "ok": true, "total": total, "already_done": already_done, "run_id": run_id,
+    }))
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,7 +501,15 @@ struct ControlReq {
 
 async fn control(State(state): State<Arc<AppState>>, Json(request): Json<ControlReq>) -> ApiResult {
     let live = state.live.lock().await;
-    let run = live.as_ref().ok_or("no run to control.")?;
+    let run = live
+        .as_ref()
+        .ok_or("You sent a run action, but no run exists. Start a run first.")?;
+    if run.stats.is_finished() {
+        return Err(
+            "You sent a run action, but this run has ended. Select New selection to start another run."
+                .into(),
+        );
+    }
     match request.action.as_str() {
         "pause" => run.controls.pause(),
         "resume" => run.controls.resume(),
@@ -467,21 +521,24 @@ async fn control(State(state): State<Arc<AppState>>, Json(request): Json<Control
     Ok(Json(json!({ "ok": true })).into_response())
 }
 
-fn snapshot_json(account: &str, snapshot: &Snapshot) -> serde_json::Value {
+fn snapshot_json(run: &Live) -> serde_json::Value {
+    let snapshot = run.stats.snapshot();
     json!({
-        "account": account,
+        "run_id": run.id,
+        "account": run.account,
+        "phase": snapshot.phase,
+        "label": snapshot.phase.label(),
         "total": snapshot.total,
         "deleted": snapshot.deleted,
         "skipped": snapshot.skipped,
+        "deferred": snapshot.deferred,
         "failed": snapshot.failed,
         "processed": snapshot.processed,
         "rate": snapshot.rate,
         "elapsed_secs": snapshot.elapsed.as_secs(),
         "eta_secs": snapshot.eta.map(|d| d.as_secs()),
         "status": snapshot.status,
-        "finished": snapshot.finished,
-        "aborted": snapshot.aborted,
-        "active_limit": snapshot.active_limit,
+        "limit_notice": snapshot.limit_notice(),
         "workers": snapshot.workers.iter().filter(|worker| worker.active).map(|worker| json!({
             "channel": worker.channel, "done": worker.done, "total": worker.total
         })).collect::<Vec<_>>(),
@@ -496,12 +553,7 @@ async fn events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     let stream = stream::unfold(state, |state| async move {
-        let payload = state
-            .live
-            .lock()
-            .await
-            .as_ref()
-            .map(|run| snapshot_json(&run.account, &run.stats.snapshot()));
+        let payload = state.live.lock().await.as_ref().map(snapshot_json);
         let event = match payload {
             Some(p) => SseEvent::default().data(p.to_string()),
             None => SseEvent::default().event("idle").data("{}"),
@@ -540,6 +592,7 @@ mod tests {
             run_lock: Mutex::new(()),
             session: "test-session".into(),
             host: host.clone(),
+            api_base: DEFAULT_BASE.into(),
         });
         let app = router(state.clone());
         let server = tokio::spawn(async move {
@@ -762,6 +815,7 @@ mod tests {
             stats.clone(),
         );
         *state.live.lock().await = Some(Live {
+            id: "test-run".into(),
             stats,
             controls,
             account: "offline fixture".into(),
@@ -791,5 +845,182 @@ mod tests {
         let body: serde_json::Value = result.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("being prepared"));
         server.abort();
+    }
+
+    /// Read one event of the panel's stream.
+    async fn next_event(client: &reqwest::Client, url: &str) -> serde_json::Value {
+        let mut events = client
+            .get(format!("{url}/api/events?session=test-session"))
+            .send()
+            .await
+            .unwrap();
+        let chunk = events.chunk().await.unwrap().unwrap();
+        let text = std::str::from_utf8(&chunk).unwrap();
+        serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap()
+    }
+
+    /// The run endpoint writes the resume log and a report, so this test runs in
+    /// a child process with a private state directory.
+    #[tokio::test]
+    async fn the_page_can_follow_a_run_that_ends_at_once_and_a_paused_run() {
+        const CHILD: &str = "DISCORD_PURGE_WEB_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::the_page_can_follow_a_run_that_ends_at_once_and_a_paused_run",
+                ])
+                .env("DISCORD_PURGE_STATE_DIR", temporary.path())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        async fn me(headers: axum::http::HeaderMap) -> axum::response::Response {
+            if headers["authorization"] == "revoked" {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Json(json!({"id":"7","username":"owner"})).into_response()
+        }
+        let discord = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", discord.local_addr().unwrap());
+        let discord_task = tokio::spawn(async move {
+            let app = Router::new().route("/v9/users/@me", get(me));
+            axum::serve(discord, app).await.unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let state = Arc::new(AppState {
+            defaults: Options {
+                token: None,
+                package: Some(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../tests/fixtures/package.zip"),
+                ),
+                guild: None,
+                channel: None,
+                filter: Filter::default(),
+                settings: Default::default(),
+                include_pinned: false,
+                token_store: resume::TokenStore::Off,
+            },
+            live: Mutex::new(None),
+            preview: Mutex::new(None),
+            run_lock: Mutex::new(()),
+            session: "test-session".into(),
+            host: host.clone(),
+            api_base,
+        });
+        let app = router(state.clone());
+        let panel = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .default_headers(
+                [(
+                    axum::http::HeaderName::from_static("x-discord-purge-session"),
+                    HeaderValue::from_static("test-session"),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .build()
+            .unwrap();
+        let url = format!("http://{host}");
+        let post = |path: &'static str, body: serde_json::Value| {
+            let (client, url) = (client.clone(), url.clone());
+            async move {
+                let response = client
+                    .post(format!("{url}{path}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                (status, response.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+
+        // A rejected token: the page learns it, and the preview survives.
+        let (_, preview) = post("/api/preview", json!({})).await;
+        let (status, rejected) = post(
+            "/api/run",
+            json!({"token":"revoked","execute":true,"preview_id":preview["preview_id"]}),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(rejected["token_rejected"], true);
+        assert!(state.preview.lock().await.is_some());
+
+        // Every previewed message is already in the resume log, so the run has
+        // nothing to do and ends before the next event.
+        let done: Vec<String> = state
+            .preview
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .run
+            .jobs
+            .iter()
+            .flat_map(|job| job.items.iter().map(u64::to_string))
+            .collect();
+        std::fs::create_dir_all(resume::state_dir()).unwrap();
+        std::fs::write(resume::log_path("7"), done.join("\n")).unwrap();
+        let (status, started) = post(
+            "/api/run",
+            json!({"token":"good","execute":true,"preview_id":preview["preview_id"]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{started}");
+        assert_eq!(started["total"], 0);
+        assert_eq!(started["already_done"], 50);
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = next_event(&client, &url).await;
+                if event["phase"]["kind"] == "completed" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            event["run_id"], started["run_id"],
+            "the page matches its run by this ID"
+        );
+        assert_eq!(event["label"], "Finished");
+
+        // An ended run accepts no action.
+        let (status, refused) = post("/api/control", json!({"action":"pause"})).await;
+        assert_eq!(status, 400);
+        assert!(refused["error"].as_str().unwrap().contains("has ended"));
+
+        // A page that loads during a pause must see the pause.
+        let stats = Stats::new(1, 1);
+        let (_, controls) = Engine::new(
+            EngineConfig::default(),
+            DiscordClient::with_base("", "http://127.0.0.1:1").unwrap(),
+            stats.clone(),
+        );
+        *state.live.lock().await = Some(Live {
+            id: "active".into(),
+            stats,
+            controls,
+            account: "fixture".into(),
+        });
+        let (status, _) = post("/api/control", json!({"action":"pause"})).await;
+        assert_eq!(status, 200);
+        let event = next_event(&client, &url).await;
+        assert_eq!(event["phase"]["kind"], "paused");
+        assert_eq!(event["label"], "Paused");
+        panel.abort();
+        discord_task.abort();
     }
 }

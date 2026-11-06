@@ -11,8 +11,10 @@
 //! - `DiscordClient` keeps an account-wide request floor and a gate for each
 //!   Discord bucket, so one channel's exhausted bucket does not hold the others.
 //! - A 429 is never an error. The throttled worker waits `retry_after`; a
-//!   global 429 pauses every worker. Repeated shared or global 429s collapse
-//!   the run to one worker, as a conservative response to repeated throttling.
+//!   global 429 pauses every worker. Repeated shared or global 429s limit the
+//!   run to one request at a time, as a conservative response to repeated
+//!   throttling. Every worker continues in its channel, and the limit stays
+//!   until the run ends.
 //!   Shared means per resource, and does not by itself mean account-wide.
 //! - A rolling count of invalid responses (401/403/non-shared 429) pauses the
 //!   run just under Discord's ~10k-per-10-minutes Cloudflare cap.
@@ -21,13 +23,91 @@
 //! The front ends (headless, TUI, web) only read a `Snapshot` and send
 //! pause/resume/stop signals; all the fragile logic lives here once.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
+use serde::Serialize;
 
+use crate::ConfirmedRun;
 use crate::api::{DeleteOutcome, DiscordClient, Scope};
+
+/// Where a run is. Workers stop sending requests in every phase after `Paused`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum RunPhase {
+    Running,
+    Paused,
+    /// The user asked to stop, and workers are ending their current step.
+    Stopping,
+    /// A failure stopped the run, and workers are ending their current step.
+    Aborting(String),
+    /// Every job was processed.
+    Completed,
+    /// The run ended because the user asked.
+    Stopped,
+    /// The run ended because of this failure.
+    Aborted(String),
+}
+
+enum RunEvent {
+    Pause,
+    Resume,
+    TogglePause,
+    Stop,
+    Abort(String),
+    Finish,
+}
+
+impl RunPhase {
+    /// Every legal move of a run. A phase ignores an event that it does not
+    /// accept, so a late pause cannot restart a stopping run, and the first
+    /// failure stays the reason.
+    fn next(self, event: RunEvent) -> Self {
+        use RunEvent::{Abort, Finish, Pause, Resume, Stop, TogglePause};
+        match (self, event) {
+            (Self::Running, Pause | TogglePause) => Self::Paused,
+            (Self::Paused, Resume | TogglePause) => Self::Running,
+            (Self::Running | Self::Paused, Stop) => Self::Stopping,
+            (Self::Running | Self::Paused | Self::Stopping, Abort(reason)) => {
+                Self::Aborting(reason)
+            }
+            (Self::Running | Self::Paused, Finish) => Self::Completed,
+            (Self::Stopping, Finish) => Self::Stopped,
+            (Self::Aborting(reason), Finish) => Self::Aborted(reason),
+            (phase, _) => phase,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Completed | Self::Stopped | Self::Aborted(_))
+    }
+
+    fn is_halted(&self) -> bool {
+        matches!(self, Self::Stopping | Self::Aborting(_)) || self.is_finished()
+    }
+
+    /// The word that a front end shows for this phase.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "Deleting",
+            Self::Paused => "Paused",
+            Self::Stopping => "Stopping",
+            Self::Aborting(_) => "Aborting",
+            Self::Completed => "Finished",
+            Self::Stopped => "Stopped",
+            Self::Aborted(_) => "Aborted",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Aborting(reason) | Self::Aborted(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
 
 /// `items` holds message IDs; each ID is also its key in the resume log.
 #[derive(Debug, Clone)]
@@ -101,27 +181,34 @@ pub struct Stats {
     total: i64,
     deleted: AtomicI64,
     skipped: AtomicI64,
+    deferred: AtomicI64,
     failed: AtomicI64,
     start: Instant,
-    finished: AtomicBool,
-    aborted: AtomicBool,
     active_limit: AtomicI64,
     inner: Mutex<StatsInner>,
 }
 
-#[derive(Default)]
 struct StatsInner {
+    phase: RunPhase,
     workers: Vec<WorkerStatus>,
     errors: Vec<String>,
     status: String,
+    /// The end of the wait that `status` describes. An event line has none.
+    status_until: Option<Instant>,
     forbidden: std::collections::HashMap<String, ForbiddenStat>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    pub phase: RunPhase,
     pub total: i64,
     pub deleted: i64,
+    /// Messages that no retry can delete: system messages, another account's
+    /// messages, and pinned messages that the run keeps.
     pub skipped: i64,
+    /// Messages that a later run can delete: the channel lost access, or a rate
+    /// limit did not end.
+    pub deferred: i64,
     pub failed: i64,
     pub processed: i64,
     pub elapsed: Duration,
@@ -130,10 +217,23 @@ pub struct Snapshot {
     pub workers: Vec<WorkerStatus>,
     pub errors: Vec<String>,
     pub status: String,
-    pub finished: bool,
-    pub aborted: bool,
     pub active_limit: i64,
     pub forbidden: Vec<ForbiddenStat>,
+}
+
+impl Snapshot {
+    /// What a front end shows after repeated rate limits reduced the run. This
+    /// comes from the limit itself, so a later status line cannot hide it.
+    pub fn limit_notice(&self) -> Option<&'static str> {
+        (self.active_limit < self.workers.len() as i64).then_some(
+            "Discord returned shared or global rate limits more than once. This run now sends one request at a time until it ends.",
+        )
+    }
+
+    /// The run ended by itself and no message remains to retry.
+    pub fn complete(&self) -> bool {
+        self.phase == RunPhase::Completed && self.deferred == 0 && self.failed == 0
+    }
 }
 
 impl Stats {
@@ -142,14 +242,17 @@ impl Stats {
             total: total as i64,
             deleted: AtomicI64::new(0),
             skipped: AtomicI64::new(0),
+            deferred: AtomicI64::new(0),
             failed: AtomicI64::new(0),
             start: Instant::now(),
-            finished: AtomicBool::new(false),
-            aborted: AtomicBool::new(false),
             active_limit: AtomicI64::new(workers as i64),
             inner: Mutex::new(StatsInner {
+                phase: RunPhase::Running,
                 workers: vec![WorkerStatus::default(); workers],
-                ..Default::default()
+                errors: Vec::new(),
+                status: String::new(),
+                status_until: None,
+                forbidden: std::collections::HashMap::new(),
             }),
         })
     }
@@ -160,12 +263,44 @@ impl Stats {
     fn add_skipped(&self) {
         self.skipped.fetch_add(1, Ordering::Relaxed);
     }
+    fn add_deferred(&self) {
+        self.deferred.fetch_add(1, Ordering::Relaxed);
+    }
     fn add_failed(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Relaxed)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            .is_finished()
+    }
+
+    fn is_halted(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            .is_halted()
+    }
+
+    fn is_paused(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            == RunPhase::Paused
+    }
+
+    fn apply(&self, event: RunEvent) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let phase = std::mem::replace(&mut guard.phase, RunPhase::Running);
+        guard.phase = phase.next(event);
     }
 
     fn set_worker(&self, index: usize, status: WorkerStatus) {
@@ -179,10 +314,22 @@ impl Stats {
     }
 
     fn set_status(&self, line: impl Into<String>) {
-        self.inner
+        let mut guard = self
+            .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status = line.into();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.status = line.into();
+        guard.status_until = None;
+    }
+
+    /// Show a line only for the wait that it describes.
+    fn set_wait_status(&self, line: impl Into<String>, wait: Duration) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.status = line.into();
+        guard.status_until = Some(Instant::now() + wait);
     }
 
     fn log_error(&self, line: impl Into<String>) {
@@ -215,8 +362,9 @@ impl Stats {
     pub fn snapshot(&self) -> Snapshot {
         let deleted = self.deleted.load(Ordering::Relaxed);
         let skipped = self.skipped.load(Ordering::Relaxed);
+        let deferred = self.deferred.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
-        let processed = deleted + skipped + failed;
+        let processed = deleted + skipped + deferred + failed;
         let total = self.total;
         let elapsed = self.start.elapsed();
         let rate = if elapsed.as_secs_f64() > 0.0 {
@@ -234,10 +382,15 @@ impl Stats {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait_ended = guard
+            .status_until
+            .is_some_and(|until| until <= Instant::now());
         Snapshot {
+            phase: guard.phase.clone(),
             total,
             deleted,
             skipped,
+            deferred,
             failed,
             processed,
             elapsed,
@@ -245,9 +398,11 @@ impl Stats {
             eta,
             workers: guard.workers.clone(),
             errors: guard.errors.clone(),
-            status: guard.status.clone(),
-            finished: self.finished.load(Ordering::Relaxed),
-            aborted: self.aborted.load(Ordering::Relaxed),
+            status: if wait_ended {
+                String::new()
+            } else {
+                guard.status.clone()
+            },
             active_limit: self.active_limit.load(Ordering::Relaxed),
             forbidden: guard.forbidden.values().cloned().collect(),
         }
@@ -255,8 +410,6 @@ impl Stats {
 }
 
 struct Control {
-    paused: AtomicBool,
-    stopped: AtomicBool,
     /// Account-wide pause-until, in millis since the engine's epoch. A 429
     /// parks every worker here.
     pause_until_ms: AtomicU64,
@@ -284,8 +437,6 @@ const ADAPTIVE_RECOVER: f64 = 0.2;
 impl Control {
     fn new(workers: usize) -> Self {
         Self {
-            paused: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
             pause_until_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             active_limit: AtomicI64::new(workers as i64),
@@ -350,21 +501,21 @@ impl Drop for RequestPermit {
 
 #[derive(Clone)]
 pub struct Controls {
-    control: Arc<Control>,
+    stats: Arc<Stats>,
 }
 
 impl Controls {
     pub fn pause(&self) {
-        self.control.paused.store(true, Ordering::Relaxed);
+        self.stats.apply(RunEvent::Pause);
     }
     pub fn resume(&self) {
-        self.control.paused.store(false, Ordering::Relaxed);
+        self.stats.apply(RunEvent::Resume);
     }
     pub fn toggle_pause(&self) {
-        self.control.paused.fetch_xor(true, Ordering::Relaxed);
+        self.stats.apply(RunEvent::TogglePause);
     }
     pub fn stop(&self) {
-        self.control.stopped.store(true, Ordering::Relaxed);
+        self.stats.apply(RunEvent::Stop);
     }
 }
 
@@ -380,7 +531,7 @@ impl Engine {
     pub fn new(config: EngineConfig, client: DiscordClient, stats: Arc<Stats>) -> (Self, Controls) {
         let control = Arc::new(Control::new(config.workers));
         let controls = Controls {
-            control: control.clone(),
+            stats: stats.clone(),
         };
         (
             Self {
@@ -393,15 +544,15 @@ impl Engine {
         )
     }
 
-    /// Delete every item in every job. `on_done` is called with the resume key
-    /// of each item that needs no further request (deleted, already gone, or a
-    /// system-message 403). Returns when all jobs finish or stop is requested.
-    pub async fn run<F>(&self, jobs: Vec<ChannelJob>, on_done: F)
+    /// Delete every item of a confirmed run. `on_done` is called with the resume
+    /// key of each item that needs no further request (deleted, already gone, or
+    /// a system-message 403). Returns when all jobs finish or stop is requested.
+    pub async fn run<F>(&self, run: ConfirmedRun, on_done: F)
     where
         F: Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static,
     {
         let on_done = Arc::new(on_done);
-        let queue = Arc::new(Mutex::new(jobs.into_iter()));
+        let queue = Arc::new(Mutex::new(run.jobs.into_iter()));
 
         let mut handles = Vec::new();
         for worker_id in 0..self.config.workers {
@@ -418,7 +569,7 @@ impl Engine {
                         else {
                             break;
                         };
-                        if this.control.stopped.load(Ordering::Relaxed) {
+                        if this.stats.is_halted() {
                             break;
                         }
                         this.run_channel(worker_id, job, on_done.clone()).await;
@@ -429,14 +580,10 @@ impl Engine {
         }
         for handle in handles {
             if let Err(error) = handle.await {
-                self.stats.log_error(format!("A deletion worker stopped: {error}. Run the app again to retry unprocessed messages."));
-                self.abort();
+                self.abort(format!("A deletion worker stopped: {error}. Run the app again to retry unprocessed messages."));
             }
         }
-        if self.control.stopped.load(Ordering::Relaxed) {
-            self.stats.aborted.store(true, Ordering::Relaxed);
-        }
-        self.stats.finished.store(true, Ordering::Relaxed);
+        self.stats.apply(RunEvent::Finish);
     }
 
     async fn run_channel<F>(&self, worker_id: usize, job: ChannelJob, on_done: Arc<F>)
@@ -446,7 +593,7 @@ impl Engine {
         let total = job.items.len();
         let mut current_delay = self.config.delay;
         for (index, &message_id) in job.items.iter().enumerate() {
-            if self.control.stopped.load(Ordering::Relaxed) {
+            if self.stats.is_halted() {
                 return;
             }
             self.stats.set_worker(
@@ -471,7 +618,7 @@ impl Engine {
                 // Account for the remaining items without sleeping between them.
                 let remaining = total - index - 1;
                 self.stats
-                    .skipped
+                    .deferred
                     .fetch_add(remaining as i64, Ordering::Relaxed);
                 return;
             }
@@ -500,14 +647,17 @@ impl Engine {
         let mut throttled = false;
 
         loop {
-            if self.control.stopped.load(Ordering::Relaxed) {
+            if self.stats.is_halted() {
                 return throttled;
             }
             if let Some(duration) = self.control.cloudflare_wait() {
-                self.stats.set_status(format!(
-                    "Cloudflare safety: holding {:.0}s, near the invalid-response cap",
-                    duration.as_secs_f64()
-                ));
+                self.stats.set_wait_status(
+                    format!(
+                        "Cloudflare safety: holding {:.0}s, near the invalid-response cap",
+                        duration.as_secs_f64()
+                    ),
+                    duration,
+                );
                 if !self.sleep(duration).await {
                     return throttled;
                 }
@@ -519,7 +669,7 @@ impl Engine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(channel_id)
             {
-                self.stats.add_skipped();
+                self.stats.add_deferred();
                 return throttled;
             }
             // Admission counts requests, not worker numbers. Every worker can
@@ -546,7 +696,7 @@ impl Engine {
             let outcome = tokio::select! {
                 result = self.client.delete_message(channel_id, &message_id, job.verified) => result,
                 _ = async {
-                    while !self.control.stopped.load(Ordering::Relaxed) {
+                    while !self.stats.is_halted() {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 } => return throttled,
@@ -570,27 +720,33 @@ impl Engine {
                     }
                     if scope.should_reduce_concurrency() {
                         self.collapse_if_needed();
-                        self.stats.set_status(format!(
-                            "{} rate limit on {label}; easing off {:.1}s",
-                            if scope == Scope::Global {
-                                "global"
-                            } else {
-                                "shared"
-                            },
-                            retry_after.as_secs_f64()
-                        ));
+                        self.stats.set_wait_status(
+                            format!(
+                                "{} rate limit on {label}; easing off {:.1}s",
+                                if scope == Scope::Global {
+                                    "global"
+                                } else {
+                                    "shared"
+                                },
+                                retry_after.as_secs_f64()
+                            ),
+                            retry_after,
+                        );
                     } else {
-                        self.stats.set_status(format!(
-                            "rate limited on {label}; easing off {:.1}s",
-                            retry_after.as_secs_f64()
-                        ));
+                        self.stats.set_wait_status(
+                            format!(
+                                "rate limited on {label}; easing off {:.1}s",
+                                retry_after.as_secs_f64()
+                            ),
+                            retry_after,
+                        );
                     }
                     rate_retries += 1;
                     if rate_retries >= MAX_RATE_RETRIES {
                         self.stats.set_status(format!(
                             "deferring {label} to a later run; still throttled after {rate_retries} tries"
                         ));
-                        self.stats.add_skipped();
+                        self.stats.add_deferred();
                         return throttled;
                     }
                     if !self.sleep(retry_after + Duration::from_millis(50)).await {
@@ -618,7 +774,7 @@ impl Engine {
                     );
                     self.stats.set_status(message.clone());
                     self.stats.log_error(message);
-                    self.stats.add_skipped(); // retryable after rejoin; not logged
+                    self.stats.add_deferred(); // retryable after rejoin; not logged
                     return throttled;
                 }
                 DeleteOutcome::Unauthorized => {
@@ -626,10 +782,10 @@ impl Engine {
                     self.stats
                         .log_error(format!("401 on {}; token invalid or expired?", message_id));
                     self.stats.add_failed();
-                    self.stats.set_status(
-                        "ABORTED: 401 Unauthorized. The token looks invalid or expired.",
+                    self.abort(
+                        "Discord answered 401 Unauthorized. The token is invalid or expired. Enter a current token and retry."
+                            .into(),
                     );
-                    self.abort();
                     return throttled;
                 }
                 DeleteOutcome::Protected(reason) => {
@@ -638,10 +794,9 @@ impl Engine {
                     return throttled;
                 }
                 DeleteOutcome::Fatal(reason) => {
-                    self.stats.set_status(reason.clone());
-                    self.stats.log_error(reason);
+                    self.stats.log_error(reason.clone());
                     self.stats.add_failed();
-                    self.abort();
+                    self.abort(reason);
                     return throttled;
                 }
                 DeleteOutcome::Permanent(reason) => {
@@ -659,10 +814,13 @@ impl Engine {
                         self.stats.add_failed();
                         return throttled;
                     }
-                    self.stats.set_status(format!(
-                        "{reason} on {label}; retry in {:.0}s",
-                        backoff.as_secs_f64()
-                    ));
+                    self.stats.set_wait_status(
+                        format!(
+                            "{reason} on {label}; retry in {:.0}s",
+                            backoff.as_secs_f64()
+                        ),
+                        backoff,
+                    );
                     if !self.sleep(backoff).await {
                         return throttled;
                     }
@@ -674,14 +832,14 @@ impl Engine {
 
     async fn gate(&self) -> bool {
         loop {
-            let wait = if self.control.paused.load(Ordering::Relaxed) {
+            let wait = if self.stats.is_paused() {
                 150
             } else {
                 let until = self.control.pause_until_ms.load(Ordering::Relaxed);
                 until.saturating_sub(self.control.now_ms())
             };
             if wait == 0 {
-                return !self.control.stopped.load(Ordering::Relaxed);
+                return !self.stats.is_halted();
             }
             if !self.sleep(Duration::from_millis(wait)).await {
                 return false;
@@ -701,8 +859,6 @@ impl Engine {
         if score >= COLLAPSE_THRESHOLD {
             self.control.active_limit.store(1, Ordering::Relaxed);
             self.stats.active_limit.store(1, Ordering::Relaxed);
-            self.stats
-                .set_status("shared or global rate limit: reduced to 1 worker");
         }
     }
 
@@ -710,16 +866,16 @@ impl Engine {
     /// run would otherwise repeat the delete.
     fn save_progress(&self, on_done: &impl Fn(&str) -> anyhow::Result<()>, message_id: &str) {
         if let Err(error) = on_done(message_id) {
-            self.stats.log_error(format!(
+            let reason = format!(
                 "Cannot save progress: {error}. Check state directory permissions before you retry."
-            ));
-            self.abort();
+            );
+            self.stats.log_error(reason.clone());
+            self.abort(reason);
         }
     }
 
-    fn abort(&self) {
-        self.stats.aborted.store(true, Ordering::Relaxed);
-        self.control.stopped.store(true, Ordering::Relaxed);
+    fn abort(&self, reason: String) {
+        self.stats.apply(RunEvent::Abort(reason));
     }
 
     fn jitter(&self, duration: Duration) -> Duration {
@@ -733,19 +889,19 @@ impl Engine {
 
     async fn sleep(&self, duration: Duration) -> bool {
         if duration.is_zero() {
-            return !self.control.stopped.load(Ordering::Relaxed);
+            return !self.stats.is_halted();
         }
         let step = Duration::from_millis(150);
         let mut left = duration;
         while left > Duration::ZERO {
-            if self.control.stopped.load(Ordering::Relaxed) {
+            if self.stats.is_halted() {
                 return false;
             }
             let pause = left.min(step);
             tokio::time::sleep(pause).await;
             left = left.saturating_sub(pause);
         }
-        !self.control.stopped.load(Ordering::Relaxed)
+        !self.stats.is_halted()
     }
 }
 

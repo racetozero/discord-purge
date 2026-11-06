@@ -9,15 +9,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::KeyCode;
-use discord_purge_core::api::{BrowseMessage, Channel, DiscordClient, is_deletable_type};
+use discord_purge_core::api::{
+    BrowseMessage, Channel, DiscordClient, TokenRejected, is_deletable_type,
+};
 use discord_purge_core::engine::{Controls, Engine, EngineConfig, Stats};
 use discord_purge_core::filter::Filter;
 use discord_purge_core::search::Target;
 use discord_purge_core::selection::{self, Catalog, MessageRange, MessageRef, Selection, parse_id};
-use discord_purge_core::{Options, PreparedRun, Source, prepare, resume};
+use discord_purge_core::{ConfirmedRun, Options, PreparedRun, Source, prepare, resume};
 use tokio::task::{JoinHandle, JoinSet};
 
 pub(crate) const TYPES: [&str; 7] = discord_purge_core::filter::TYPE_NAMES;
+
+const JOB_BUSY: &str = "A preview or start check is running. Wait, or press Esc to cancel it.";
 
 pub(crate) struct Server {
     pub id: String,
@@ -65,29 +69,94 @@ pub(crate) enum Range {
     Only(BTreeSet<MessageRef>),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HistoryLoad {
+    Idle,
+    Loading,
+    /// The first page failed. A failed older page keeps the shown messages, so
+    /// it stays `Idle` and the next key press retries it.
+    Failed(String),
+}
+
 pub(crate) struct History {
     pub channel: Channel,
     pub messages: Vec<BrowseMessage>,
     pub more: bool,
-    pub loading: bool,
+    pub load: HistoryLoad,
     pub cursor: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SourceField {
+    Kind,
+    Token,
+    Package,
 }
 
 pub(crate) struct SourceForm {
     pub package_mode: bool,
     pub token: String,
     pub package: String,
-    /// 0: source kind, 1: token, 2: package path.
-    pub field: usize,
+    pub field: SourceField,
     /// Asked for a token to delete an offline preview; keep the lists.
     pub for_delete: bool,
     pub error: Option<String>,
 }
 
+impl SourceForm {
+    /// The fields that this form shows, in order. The delete form shows only
+    /// the token, so focus can never reach a hidden field.
+    fn fields(&self) -> &'static [SourceField] {
+        if self.for_delete {
+            &[SourceField::Token]
+        } else {
+            &[SourceField::Kind, SourceField::Token, SourceField::Package]
+        }
+    }
+
+    fn text_field(&mut self) -> Option<&mut String> {
+        match self.field {
+            SourceField::Kind => None,
+            SourceField::Token => Some(&mut self.token),
+            SourceField::Package => Some(&mut self.package),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FilterField {
+    Content,
+    Types,
+    After,
+    Before,
+    Pinned,
+    Workers,
+    Delay,
+    Jitter,
+}
+
+const FILTER_FIELDS: [FilterField; 8] = [
+    FilterField::Content,
+    FilterField::Types,
+    FilterField::After,
+    FilterField::Before,
+    FilterField::Pinned,
+    FilterField::Workers,
+    FilterField::Delay,
+    FilterField::Jitter,
+];
+
+/// The field before or after `field` in `order`. The ends do not wrap.
+fn step_field<T: Copy + PartialEq>(order: &[T], field: T, code: KeyCode) -> T {
+    let index = order.iter().position(|f| *f == field).unwrap_or(0);
+    order[match code {
+        KeyCode::Up | KeyCode::BackTab => index.saturating_sub(1),
+        _ => (index + 1).min(order.len() - 1),
+    }]
+}
+
 pub(crate) struct FilterForm {
-    /// 0 content, 1 types, 2 start date, 3 end date, 4 pinned, 5 workers,
-    /// 6 delay, 7 jitter.
-    pub field: usize,
+    pub field: FilterField,
     pub content: String,
     pub types: [bool; 7],
     pub type_cursor: usize,
@@ -98,6 +167,20 @@ pub(crate) struct FilterForm {
     pub delay: String,
     pub jitter: String,
     pub error: Option<String>,
+}
+
+impl FilterForm {
+    fn text_field(&mut self) -> Option<&mut String> {
+        match self.field {
+            FilterField::Content => Some(&mut self.content),
+            FilterField::After => Some(&mut self.after),
+            FilterField::Before => Some(&mut self.before),
+            FilterField::Workers => Some(&mut self.workers),
+            FilterField::Delay => Some(&mut self.delay),
+            FilterField::Jitter => Some(&mut self.jitter),
+            FilterField::Types | FilterField::Pinned => None,
+        }
+    }
 }
 
 pub(crate) enum Modal {
@@ -228,13 +311,17 @@ pub(crate) enum Loaded {
         result: anyhow::Result<PreparedRun>,
     },
     Confirmed {
-        result: anyhow::Result<(PreparedRun, DiscordClient)>,
+        revision: u64,
+        result: anyhow::Result<(ConfirmedRun, DiscordClient)>,
     },
 }
 
 pub(crate) struct App {
     pub config: Options,
     pub token: Option<String>,
+    /// The token that Discord last rejected, so a reload does not read the same
+    /// saved token again.
+    rejected_token: Option<String>,
     pub package: Option<PathBuf>,
     generation: u64,
     pub listed: bool,
@@ -276,6 +363,7 @@ impl App {
         Self {
             config,
             token,
+            rejected_token: None,
             package,
             generation: 0,
             listed: false,
@@ -351,9 +439,9 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             field: if for_delete || self.package.is_none() {
-                1
+                SourceField::Token
             } else {
-                2
+                SourceField::Package
             },
             for_delete,
             error: None,
@@ -365,7 +453,7 @@ impl App {
         let chosen: Vec<&str> = inputs.types.split(',').collect();
         let settings = &self.config.settings;
         self.modal = Some(Modal::Filters(FilterForm {
-            field: 0,
+            field: FilterField::Content,
             content: inputs.content,
             types: TYPES.map(|t| chosen.contains(&t)),
             type_cursor: 0,
@@ -393,7 +481,11 @@ impl App {
         self.changed();
         // Pick up a token that another front end saved while this one ran.
         if self.token.is_none() {
-            self.token = self.config.token_store.load();
+            self.token = self
+                .config
+                .token_store
+                .load()
+                .filter(|saved| Some(saved) != self.rejected_token.as_ref());
         }
         let Some(client) = self.client_or_error() else {
             return;
@@ -458,10 +550,10 @@ impl App {
         let Some(history) = &mut self.history else {
             return;
         };
-        if history.loading || (older && !history.more) {
+        if history.load == HistoryLoad::Loading || (older && !history.more) {
             return;
         }
-        history.loading = true;
+        history.load = HistoryLoad::Loading;
         let channel_id = history.channel.id.clone();
         let before = older
             .then(|| history.messages.last().map(|message| message.id.clone()))
@@ -484,18 +576,16 @@ impl App {
 
     fn open_history(&mut self, channel: Channel) {
         self.focus = Focus::Messages;
-        if self
-            .history
-            .as_ref()
-            .is_some_and(|history| history.channel.id == channel.id)
-        {
+        if self.history.as_ref().is_some_and(|history| {
+            history.channel.id == channel.id && !matches!(history.load, HistoryLoad::Failed(_))
+        }) {
             return;
         }
         self.history = Some(History {
             channel,
             messages: Vec::new(),
             more: false,
-            loading: false,
+            load: HistoryLoad::Idle,
             cursor: 0,
         });
         self.load_messages(false);
@@ -646,9 +736,7 @@ impl App {
 
     fn start_preview(&mut self) {
         if self.job.is_some() {
-            self.notice = Some(
-                "A preview or start check is running. Wait, or press Esc to cancel it.".into(),
-            );
+            self.notice = Some(JOB_BUSY.into());
             return;
         }
         let selection = self.selection();
@@ -687,6 +775,10 @@ impl App {
     }
 
     fn start_run(&mut self) {
+        if self.job.is_some() {
+            self.notice = Some(JOB_BUSY.into());
+            return;
+        }
         let Some(preview) = self.preview_ready().cloned() else {
             self.error = Some(
                 "The preview is out of date. Press p to preview again before you delete.".into(),
@@ -696,14 +788,22 @@ impl App {
         let Some(client) = self.client_or_error() else {
             return;
         };
+        let revision = self.revision;
         self.activity = "Checking the account and saved progress".into();
         self.job = Some(tokio::spawn(async move {
             let result = preview.confirm(&client).await.map(|run| (run, client));
-            Loaded::Confirmed { result }
+            Loaded::Confirmed { revision, result }
         }));
     }
 
-    fn begin_run(&mut self, run: PreparedRun, client: DiscordClient) -> anyhow::Result<()> {
+    /// After a 401, stop using the token, so that the next delete asks for one.
+    fn forget_if_rejected(&mut self, error: &anyhow::Error) {
+        if error.is::<TokenRejected>() {
+            self.rejected_token = self.token.take();
+        }
+    }
+
+    fn begin_run(&mut self, run: ConfirmedRun, client: DiscordClient) -> anyhow::Result<()> {
         let log = resume::ResumeLog::open(&run.account_id)?;
         let stats = Stats::new(run.total, self.config.settings.workers);
         let (engine, controls) = Engine::new(self.config.settings.clone(), client, stats.clone());
@@ -713,12 +813,14 @@ impl App {
                 run.already_done
             ));
         }
-        self.account = run.account_label;
+        self.account = run.account_label.clone();
         self.stats = Some(stats);
         self.controls = Some(controls);
         tokio::spawn(async move {
-            engine.run(run.jobs, move |key| log.record(key)).await;
+            engine.run(run, move |key| log.record(key)).await;
         });
+        // The run screen draws no modal, so a form must not wait behind it.
+        self.modal = None;
         self.screen = Screen::Running;
         Ok(())
     }
@@ -790,6 +892,7 @@ impl App {
                     }
                 }
                 Err(error) => {
+                    self.forget_if_rejected(&error);
                     self.error = Some(format!(
                         "{error} Press s to change the token or package, or r to retry."
                     ))
@@ -820,7 +923,7 @@ impl App {
                 else {
                     return;
                 };
-                history.loading = false;
+                history.load = HistoryLoad::Idle;
                 match result {
                     Ok(messages) => {
                         history.more = messages.len() == discord_purge_core::api::HISTORY_PAGE;
@@ -831,7 +934,8 @@ impl App {
                             history.cursor = 0;
                         }
                     }
-                    Err(error) => self.error = Some(error.to_string()),
+                    Err(error) if older => self.error = Some(error.to_string()),
+                    Err(error) => history.load = HistoryLoad::Failed(error.to_string()),
                 }
             }
             Loaded::Preview { revision, result } => match result {
@@ -846,18 +950,42 @@ impl App {
                         self.account = run.account_label.clone();
                     }
                     self.preview = Some((run, revision));
-                    self.modal = Some(Modal::Preview { cursor: 0 });
+                    // Do not replace a form that the user opened while this ran.
+                    // The plan shows the new count.
+                    if self.modal.is_none() {
+                        self.modal = Some(Modal::Preview { cursor: 0 });
+                    }
                 }
-                Err(error) => self.error = Some(error.to_string()),
+                Err(error) => {
+                    self.forget_if_rejected(&error);
+                    self.error = Some(error.to_string());
+                }
             },
-            Loaded::Confirmed { result } => {
-                if result.is_ok() {
-                    self.remember_token();
+            Loaded::Confirmed { revision, result } => {
+                let accepted = result.is_ok();
+                match result {
+                    Ok(_) if revision != self.revision => {
+                        self.notice = Some(
+                            "The selection changed during the start check. Nothing was deleted. Press p to preview again."
+                                .into(),
+                        );
+                    }
+                    Ok((run, client)) => {
+                        if let Err(error) = self.begin_run(run, client) {
+                            self.error = Some(format!(
+                                "The run did not start: {error} Correct the problem and press d again."
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        self.forget_if_rejected(&error);
+                        self.error = Some(format!(
+                            "The run did not start: {error} Correct the problem and press d again."
+                        ));
+                    }
                 }
-                if let Err(error) = result.and_then(|(run, client)| self.begin_run(run, client)) {
-                    self.error = Some(format!(
-                        "The run did not start: {error} Correct the problem and press d again."
-                    ));
+                if accepted {
+                    self.remember_token();
                 }
             }
         }
@@ -916,25 +1044,15 @@ impl App {
     pub fn paste(&mut self, text: &str) {
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         let field = match &mut self.modal {
-            Some(Modal::Source(form)) => match form.field {
-                1 => &mut form.token,
-                2 => &mut form.package,
-                _ => return,
-            },
-            Some(Modal::Link { input, .. }) => input,
-            Some(Modal::Filters(form)) => match form.field {
-                0 => &mut form.content,
-                2 => &mut form.after,
-                3 => &mut form.before,
-                5 => &mut form.workers,
-                6 => &mut form.delay,
-                7 => &mut form.jitter,
-                _ => return,
-            },
-            None if self.typing_query => &mut self.query,
-            _ => return,
+            Some(Modal::Source(form)) => form.text_field(),
+            Some(Modal::Link { input, .. }) => Some(input),
+            Some(Modal::Filters(form)) => form.text_field(),
+            None if self.typing_query => Some(&mut self.query),
+            _ => None,
         };
-        field.push_str(&text);
+        if let Some(field) = field {
+            field.push_str(&text);
+        }
     }
 
     pub fn key(&mut self, code: KeyCode) {
@@ -1125,6 +1243,10 @@ impl App {
             self.focus = Focus::Where;
             return;
         };
+        if code == KeyCode::Enter && matches!(history.load, HistoryLoad::Failed(_)) {
+            self.load_messages(false);
+            return;
+        }
         let last = history.messages.len().saturating_sub(1);
         if code == KeyCode::Down && history.cursor == last && history.more {
             self.load_messages(true);
@@ -1282,21 +1404,25 @@ impl App {
     fn source_key(&mut self, mut form: SourceForm, code: KeyCode) -> Option<Modal> {
         match code {
             KeyCode::Esc => return None,
-            KeyCode::Up | KeyCode::BackTab => form.field = form.field.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => form.field = (form.field + 1).min(2),
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
+                form.field = step_field(form.fields(), form.field, code)
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if form.field == SourceField::Kind =>
+            {
                 form.package_mode = !form.package_mode
             }
             KeyCode::Enter => {
-                let token = form.token.trim().to_string();
-                if !token.is_empty() {
-                    self.token = Some(token);
-                }
+                // Keep the app's token until this form passes its checks.
+                let token = Some(form.token.trim().to_string())
+                    .filter(|token| !token.is_empty())
+                    .or_else(|| self.token.clone());
                 if form.for_delete {
-                    if self.token.is_none() {
+                    if token.is_none() {
                         form.error = Some("You entered no token. Paste your account token to delete, or press Esc to keep the preview only.".into());
                         return Some(Modal::Source(form));
                     }
+                    self.token = token;
                     return Some(Modal::Confirm);
                 }
                 if form.package_mode {
@@ -1310,22 +1436,20 @@ impl App {
                     }
                     self.package = Some(path);
                 } else {
-                    if self.token.is_none() {
+                    if token.is_none() {
                         form.error = Some("You entered no token. Paste your account token, or choose Data package to browse offline.".into());
                         return Some(Modal::Source(form));
                     }
                     self.package = None;
                 }
+                self.token = token;
                 self.load_catalog();
                 return None;
             }
             code => {
-                let field = match form.field {
-                    1 => &mut form.token,
-                    2 => &mut form.package,
-                    _ => return Some(Modal::Source(form)),
-                };
-                edit(field, code);
+                if let Some(field) = form.text_field() {
+                    edit(field, code);
+                }
             }
         }
         Some(Modal::Source(form))
@@ -1334,33 +1458,27 @@ impl App {
     fn filters_key(&mut self, mut form: FilterForm, code: KeyCode) -> Option<Modal> {
         match code {
             KeyCode::Esc => return None,
-            KeyCode::Up | KeyCode::BackTab => form.field = form.field.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => form.field = (form.field + 1).min(7),
-            KeyCode::Left if form.field == 1 => {
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
+                form.field = step_field(&FILTER_FIELDS, form.field, code)
+            }
+            KeyCode::Left if form.field == FilterField::Types => {
                 form.type_cursor = form.type_cursor.saturating_sub(1)
             }
-            KeyCode::Right if form.field == 1 => {
+            KeyCode::Right if form.field == FilterField::Types => {
                 form.type_cursor = (form.type_cursor + 1).min(TYPES.len() - 1)
             }
-            KeyCode::Char(' ') if form.field == 1 => {
+            KeyCode::Char(' ') if form.field == FilterField::Types => {
                 form.types[form.type_cursor] = !form.types[form.type_cursor]
             }
-            KeyCode::Char(' ') if form.field == 4 => form.pinned = !form.pinned,
+            KeyCode::Char(' ') if form.field == FilterField::Pinned => form.pinned = !form.pinned,
             KeyCode::Enter => match self.apply_filters(&form) {
                 Ok(()) => return None,
                 Err(error) => form.error = Some(error.to_string()),
             },
             code => {
-                let field = match form.field {
-                    0 => &mut form.content,
-                    2 => &mut form.after,
-                    3 => &mut form.before,
-                    5 => &mut form.workers,
-                    6 => &mut form.delay,
-                    7 => &mut form.jitter,
-                    _ => return Some(Modal::Filters(form)),
-                };
-                edit(field, code);
+                if let Some(field) = form.text_field() {
+                    edit(field, code);
+                }
             }
         }
         Some(Modal::Filters(form))
@@ -1570,6 +1688,178 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::LinkRange(_))));
         app.key(KeyCode::Char('n'));
         assert!(matches!(&app.range, Range::Newer(r) if r.message_id == "444"));
+    }
+
+    /// A confirm result as the job would deliver it, from a preview that a local
+    /// address confirmed, so a test sends nothing to Discord.
+    async fn confirmed_result() -> anyhow::Result<(ConfirmedRun, DiscordClient)> {
+        let discord = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", discord.local_addr().unwrap());
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v9/users/@me",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"id":"7","username":"owner"}))
+                }),
+            );
+            axum::serve(discord, app).await.unwrap();
+        });
+        let client = DiscordClient::with_base("token", base)?;
+        let run = PreparedRun {
+            account_id: "unknown".into(),
+            account_label: String::new(),
+            jobs: Vec::new(),
+            total: 0,
+            complete: true,
+        }
+        .confirm(&client)
+        .await?;
+        Ok((run, client))
+    }
+
+    #[tokio::test]
+    async fn a_confirm_for_an_old_selection_starts_no_run() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        let revision = app.revision;
+        cursor_to(&mut app, Row::ServersHeader);
+        app.key(KeyCode::Char(' '));
+        app.apply(Loaded::Confirmed {
+            revision,
+            result: confirmed_result().await,
+        });
+        assert_eq!(app.screen, Screen::Workspace);
+        assert!(app.stats.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Nothing was deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_start_waits_for_the_running_job() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        cursor_to(&mut app, Row::ServersHeader);
+        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('p'));
+        settle(&mut app).await;
+        let held = tokio::spawn(std::future::pending::<Loaded>());
+        let handle_id = held.id();
+        app.job = Some(held);
+        app.modal = Some(Modal::Confirm);
+        app.key(KeyCode::Char('y'));
+        assert_eq!(app.job.as_ref().unwrap().id(), handle_id);
+        assert_eq!(app.notice.as_deref(), Some(JOB_BUSY));
+        app.cancel_tasks();
+    }
+
+    #[tokio::test]
+    async fn a_finished_preview_keeps_an_open_form() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        cursor_to(&mut app, Row::ServersHeader);
+        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('p'));
+        app.key(KeyCode::Char('f'));
+        app.paste("typed text");
+        settle(&mut app).await;
+        assert!(app.preview_ready().is_some(), "the plan shows the count");
+        let Some(Modal::Filters(form)) = &app.modal else {
+            panic!("the preview replaced the open form");
+        };
+        assert_eq!(form.content, "typed text");
+    }
+
+    #[tokio::test]
+    async fn a_failed_history_load_can_retry() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        let missing = Channel {
+            id: "999".into(),
+            name: Some("gone".into()),
+            kind: 1,
+            guild_id: None,
+            recipients: Vec::new(),
+        };
+        app.open_history(missing.clone());
+        settle(&mut app).await;
+        let load = |app: &App| app.history.as_ref().unwrap().load.clone();
+        assert!(matches!(load(&app), HistoryLoad::Failed(_)));
+        app.key(KeyCode::Enter);
+        assert!(app.busy(), "Enter must load the channel again");
+        settle(&mut app).await;
+        assert!(matches!(load(&app), HistoryLoad::Failed(_)));
+        app.open_history(missing);
+        assert!(app.busy(), "opening the channel again must load it again");
+        settle(&mut app).await;
+    }
+
+    #[tokio::test]
+    async fn the_delete_form_keeps_focus_on_the_token() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        cursor_to(&mut app, Row::ServersHeader);
+        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('p'));
+        settle(&mut app).await;
+        app.key(KeyCode::Char('d'));
+        for code in [KeyCode::Down, KeyCode::Tab, KeyCode::Up, KeyCode::Down] {
+            app.key(code);
+        }
+        app.paste("pasted-token");
+        app.key(KeyCode::Enter);
+        assert!(matches!(app.modal, Some(Modal::Confirm)));
+        assert_eq!(app.token.as_deref(), Some("pasted-token"));
+    }
+
+    #[tokio::test]
+    async fn a_form_error_leaves_the_token_unchanged() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        app.key(KeyCode::Char('s'));
+        app.key(KeyCode::Up);
+        app.paste("new-token");
+        app.key(KeyCode::Down);
+        app.paste("/no/such/package");
+        app.key(KeyCode::Enter);
+        assert!(matches!(app.modal, Some(Modal::Source(_))));
+        assert_eq!(app.token, None);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_makes_the_next_delete_ask_for_a_token() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        cursor_to(&mut app, Row::ServersHeader);
+        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('p'));
+        settle(&mut app).await;
+        app.token = Some("revoked".into());
+        app.apply(Loaded::Confirmed {
+            revision: app.revision,
+            result: Err(TokenRejected.into()),
+        });
+        assert_eq!(app.token, None);
+        assert!(app.error.as_deref().unwrap().contains("rejected"));
+        app.modal = None;
+        app.key(KeyCode::Char('d'));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Source(SourceForm {
+                for_delete: true,
+                ..
+            }))
+        ));
     }
 
     #[test]

@@ -243,6 +243,19 @@ impl Limits {
     }
 }
 
+/// Discord rejected the account token with a 401. A front end tests for this
+/// with `error.is::<TokenRejected>()` and asks for a new token.
+#[derive(Debug)]
+pub struct TokenRejected;
+
+impl std::fmt::Display for TokenRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Discord rejected the token (401). Enter a current account token and retry.")
+    }
+}
+
+impl std::error::Error for TokenRejected {}
+
 /// Split a request into Discord's rate-limit identity: the route template, with
 /// IDs replaced, and the major parameter (the channel, guild, or webhook ID).
 fn route_key(method: &reqwest::Method, path: &str) -> (String, String) {
@@ -311,13 +324,25 @@ impl DiscordClient {
             None => reqwest::header::HeaderMap::new(),
         };
         let http = client_builder(headers, http3).build()?;
+        let token = token.into();
+        // Discord limits the account, not this object. The front ends make
+        // several clients, so all clients of one token share one set of limits.
+        type ByAccount = HashMap<(String, String), Arc<Mutex<Limits>>>;
+        static LIMITS: OnceLock<Mutex<ByAccount>> = OnceLock::new();
+        let limits = LIMITS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((base.clone(), token.clone()))
+            .or_default()
+            .clone();
         Ok(Self {
             http,
             base,
-            token: token.into(),
+            token,
             account_id: Arc::new(OnceLock::new()),
             include_pinned: false,
-            limits: Arc::default(),
+            limits,
             http3,
             metadata,
         })
@@ -586,7 +611,7 @@ impl DiscordClient {
             )
             .await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            anyhow::bail!("the token was rejected (401). Check that it is a current user token.");
+            return Err(TokenRejected.into());
         }
         if !response.status().is_success() {
             anyhow::bail!("GET /users/@me returned {}", response.status());

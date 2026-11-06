@@ -686,10 +686,12 @@ name = "discord-purge-tui"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "axum",
  "crossterm",
  "discord-purge-core",
  "futures",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 
@@ -706,6 +708,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

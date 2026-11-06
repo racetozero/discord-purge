@@ -8,11 +8,13 @@ use axum::{
 };
 use discord_purge_core::{
     api::DiscordClient,
-    engine::{ChannelJob, Engine, EngineConfig, Stats},
+    engine::{ChannelJob, Engine, EngineConfig, RunPhase, Stats},
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod support;
 
 struct Fixture {
     mode: &'static str,
@@ -118,10 +120,13 @@ async fn user_account_deletes_after_exact_history_verification() {
     let done = Arc::new(Mutex::new(Vec::new()));
     let completed = done.clone();
     engine
-        .run(vec![job(2)], move |key| {
-            completed.lock().unwrap().push(key.to_string());
-            Ok(())
-        })
+        .run(
+            support::confirmed(&client, vec![job(2)]).await,
+            move |key| {
+                completed.lock().unwrap().push(key.to_string());
+                Ok(())
+            },
+        )
         .await;
     assert_eq!(
         stats.snapshot().deleted,
@@ -142,11 +147,12 @@ async fn unverified_foreign_and_pinned_history_never_authorizes_delete() {
     for mode in ["neighbor", "empty", "foreign", "pinned", "missing-pin"] {
         let (client, st, server) = server(mode).await;
         let stats = Stats::new(1, 1);
+        let run = support::confirmed(&client, vec![job(1)]).await;
         let (engine, _) = Engine::new(config(), client, stats.clone());
         let done = Arc::new(Mutex::new(Vec::new()));
         let completed = done.clone();
         engine
-            .run(vec![job(1)], move |key| {
+            .run(run, move |key| {
                 completed.lock().unwrap().push(key.to_string());
                 Ok(())
             })
@@ -171,10 +177,11 @@ async fn unverified_foreign_and_pinned_history_never_authorizes_delete() {
 async fn verified_jobs_delete_without_a_history_check() {
     let (client, st, server) = server("foreign").await;
     let stats = Stats::new(2, 1);
-    let (engine, _) = Engine::new(config(), client, stats.clone());
     let mut verified = job(2);
     verified.verified = true;
-    engine.run(vec![verified], |_| Ok(())).await;
+    let run = support::confirmed(&client, vec![verified]).await;
+    let (engine, _) = Engine::new(config(), client, stats.clone());
+    engine.run(run, |_| Ok(())).await;
     assert_eq!(*st.deleted.lock().unwrap(), vec!["20", "21"]);
     assert!(st.calls.lock().unwrap().is_empty());
     server.abort();
@@ -187,12 +194,13 @@ async fn endpoint_error_aborts_and_access_error_defers_without_per_item_waits() 
         let stats = Stats::new(31, 1);
         let mut cfg = config();
         cfg.delay = Duration::from_secs(120);
+        let run = support::confirmed(&client, vec![job(31)]).await;
         let (engine, _) = Engine::new(cfg, client, stats.clone());
         let done = Arc::new(Mutex::new(Vec::new()));
         let completed = done.clone();
         tokio::time::timeout(
             Duration::from_secs(1),
-            engine.run(vec![job(31)], move |key| {
+            engine.run(run, move |key| {
                 completed.lock().unwrap().push(key.to_string());
                 Ok(())
             }),
@@ -208,13 +216,20 @@ async fn endpoint_error_aborts_and_access_error_defers_without_per_item_waits() 
         );
         let snapshot = stats.snapshot();
         if mode == "endpoint" {
-            assert!(snapshot.aborted);
+            assert!(
+                matches!(&snapshot.phase, RunPhase::Aborted(reason) if reason.contains("Only bots"))
+            );
             assert_eq!(snapshot.failed, 1);
-            assert_eq!(snapshot.skipped, 0);
+            assert_eq!(snapshot.deferred, 0);
             assert!(snapshot.errors.iter().any(|e| e.contains("Only bots")));
         } else {
-            assert!(!snapshot.aborted);
-            assert_eq!(snapshot.skipped, 31);
+            assert_eq!(snapshot.phase, RunPhase::Completed);
+            assert_eq!(snapshot.skipped, 0);
+            assert_eq!(snapshot.deferred, 31, "a later run can retry these");
+            assert!(
+                !snapshot.complete(),
+                "messages to retry must make the run incomplete"
+            );
             assert_eq!(snapshot.failed, 0);
             assert!(snapshot.status.contains("Missing Access"));
             assert!(snapshot.errors.iter().any(|e| e.contains("Missing Access")));

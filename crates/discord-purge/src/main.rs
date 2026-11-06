@@ -253,6 +253,19 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
+    anyhow::ensure!(
+        !(cli.web && cli.no_tui),
+        "You combined --web and --no-tui. Use --web for the panel, or --no-tui for a plain run."
+    );
+    anyhow::ensure!(
+        cli.no_tui || !cli.execute,
+        "You used --execute without --no-tui. --execute applies only to a plain run. Add --no-tui, or remove --execute and confirm the deletion in the terminal UI or web panel."
+    );
+    anyhow::ensure!(
+        cli.no_tui || cli.report.is_none(),
+        "You used --report without --no-tui. --report applies only to a plain run. Add --no-tui, or remove --report to save the report in the state directory."
+    );
+
     // Prepare one launch identity before online frontends start. Offline package
     // previews keep their no-network, no-state behavior.
     if cli.web || cli.package.is_none() || cli.execute {
@@ -266,7 +279,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let cli_token = cli.token.clone().filter(|t| !t.trim().is_empty());
 
-    if cli.web || !cli.no_tui {
+    if !cli.no_tui {
         // The front ends read the saved token when they need it, so a token
         // that another front end saves while this one runs is used too.
         let options = Options {
@@ -332,6 +345,9 @@ async fn main() -> anyhow::Result<()> {
     if preview.jobs.len() > 50 {
         println!("  … and {} more channel(s)", preview.jobs.len() - 50);
     }
+    if !preview.complete {
+        println!("{}", discord_purge_core::search::INCOMPLETE_NOTICE);
+    }
 
     if !cli.execute {
         println!("\nDry run: nothing was deleted. Re-run with --execute to delete.");
@@ -352,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("Deleting {} message(s)…", run.total);
 
+    let account = run.account_label.clone();
     let stats = Stats::new(run.total, settings.workers);
     let (engine, controls) = Engine::new(settings, client, stats.clone());
     let log = resume::ResumeLog::open(&run.account_id)?;
@@ -374,40 +391,46 @@ async fn main() -> anyhow::Result<()> {
                 // A closed pipe ends only the progress line. It must not stop the deletion run.
                 let written = write!(
                     stderr,
-                    "\r  {}/{}  deleted {}  skipped {}  failed {}  {:.2}/s   ",
+                    "\r  {}/{}  deleted {}  skipped {}  deferred {}  failed {}  {:.2}/s   ",
                     snapshot.processed,
                     snapshot.total,
                     snapshot.deleted,
                     snapshot.skipped,
+                    snapshot.deferred,
                     snapshot.failed,
                     snapshot.rate
                 )
                 .and_then(|()| stderr.flush());
-                if written.is_err() || snapshot.finished {
+                if written.is_err() || snapshot.phase.is_finished() {
                     break;
                 }
             }
         }
     });
 
-    engine.run(run.jobs, move |key| log.record(key)).await;
+    engine.run(run, move |key| log.record(key)).await;
     printer.abort();
     signal.abort();
 
     let snap = stats.snapshot();
     // Write the report first: printing can panic on a closed pipe.
-    let report = resume::write_report(&run.account_label, &snap, cli.report.as_deref())?;
+    let report = resume::write_report(&account, &snap, cli.report.as_deref())?;
     eprintln!();
     println!(
-        "Done. deleted {} | skipped {} | failed {} in {}.",
+        "{}. deleted {} | skipped {} | deferred {} | failed {} in {}.",
+        snap.phase.label(),
         snap.deleted,
         snap.skipped,
+        snap.deferred,
         snap.failed,
         format_duration(snap.elapsed)
     );
+    if let Some(notice) = snap.limit_notice() {
+        println!("{notice}");
+    }
     println!("Report: {}", report.display());
     anyhow::ensure!(
-        !snap.aborted && snap.failed == 0,
+        snap.complete(),
         "Deletion did not complete. Read the report at {} and retry the remaining messages after you correct the error.",
         report.display()
     );

@@ -261,12 +261,17 @@ function h(tag, props = {}, ...children) {
 const session = new URLSearchParams(location.hash.slice(1)).get('session') || '';
 const TYPES = ['text', 'image', 'video', 'audio', 'voice', 'file', 'link'];
 const NON_DELETABLE = [1, 2, 3, 4, 5, 21, 35, 64];
+/* The one thing the Plan pane is doing. Starting ends when /api/run answers. */
+const Stage = Object.freeze({ Plan: 'plan', Previewing: 'previewing', Confirming: 'confirming', Starting: 'starting', Run: 'run' });
+const FINISHED_PHASES = ['completed', 'stopped', 'aborted'];
 const S = {
-  mode: 'account', hasToken: false, defaults: {}, account: null, gen: 0,
+  mode: 'account', hasToken: false, defaults: {}, account: null, gen: 0, listing: false,
   servers: [], dms: [], history: null,
   range: { kind: 'all', anchor: null, picked: new Map() },
-  revision: 0, preview: null, previewing: false, confirming: false, running: false, error: '',
+  revision: 0, preview: null, stage: Stage.Plan, runId: null, alreadyDone: 0, error: '',
 };
+const runActive = () => S.stage === Stage.Starting || S.stage === Stage.Run;
+const syncLoad = () => { $('load').disabled = S.listing || runActive(); };
 const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 const when = (id) => {
   try { return new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }); }
@@ -283,7 +288,10 @@ async function api(path, body) {
   let data;
   try { data = await response.json(); }
   catch { throw new Error(response.status === 403 ? 'This page has no valid session. Open the full URL that the app printed, including #session=.' : `The panel answered with status ${response.status}. Restart the app and open the printed URL.`); }
-  if (data.ok === false) throw new Error(data.error);
+  if (data.ok === false) {
+    if (data.token_rejected) tokenRejected();
+    throw new Error(data.error);
+  }
   return data;
 }
 const source = () => ({ token: $('token').value.trim(), package: S.mode === 'package' ? $('pkg').value.trim() : '' });
@@ -302,21 +310,33 @@ function tokenSaved() {
   $('token').value = '';
   setMode(S.mode);
 }
+// Discord rejected the token in use, so the page must ask for another one.
+function tokenRejected() {
+  S.hasToken = false;
+  $('token').value = '';
+  setMode(S.mode);
+}
 $('modeAccount').onclick = () => setMode('account');
 $('modePackage').onclick = () => { setMode('package'); $('pkg').focus(); };
 $('load').onclick = loadCatalog;
 for (const id of ['token', 'pkg']) $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') loadCatalog(); });
-$('token').addEventListener('input', () => { if (S.preview) { S.preview = null; renderPlan(); } });
+$('token').addEventListener('input', () => {
+  if (runActive()) return;
+  if (S.stage === Stage.Confirming) S.stage = Stage.Plan;
+  if (S.preview) { S.preview = null; renderPlan(); }
+});
 
-function changed() { S.revision++; S.confirming = false; renderPlan(); }
+function changed() { S.revision++; if (S.stage === Stage.Confirming) S.stage = Stage.Plan; renderPlan(); }
 function fail(e) { S.error = String(e.message || e); renderPlan(); setTab('plan', true); }
 
 async function loadCatalog() {
+  // The server refuses a browse during a run, and the selection must survive.
+  if (runActive()) return;
   const gen = ++S.gen;
   Object.assign(S, { servers: [], dms: [], history: null, account: null, error: '', preview: null });
   S.range = { kind: 'all', anchor: null, picked: new Map() };
   $('who').textContent = 'Loading…'; $('whoDot').className = 'dot';
-  $('load').disabled = true;
+  S.listing = true; syncLoad();
   renderAll();
   try {
     const res = await api('/api/catalog', source());
@@ -336,7 +356,7 @@ async function loadCatalog() {
     $('who').textContent = 'Not loaded';
     fail(e);
   } finally {
-    if (gen === S.gen) $('load').disabled = false;
+    if (gen === S.gen) { S.listing = false; syncLoad(); }
     changed(); renderAll();
   }
 }
@@ -347,13 +367,13 @@ async function loadChannels(server) {
   try {
     const res = await api('/api/channels', { ...source(), guild_ids: [server.id] });
     if (gen === S.gen) server.channels = res.channels;
-  } catch (e) { server.expanded = false; fail(e); }
+  } catch (e) { if (gen === S.gen) { server.expanded = false; fail(e); } }
   finally { server.loading = false; if (gen === S.gen) renderWhere(); }
 }
 
 async function openHistory(channel, older = false) {
-  if (!older && S.history?.channel.id === channel.id) { setTab('messages'); return; }
-  if (!older) S.history = { channel, messages: [], more: false, loading: false };
+  if (!older && S.history?.channel.id === channel.id && !S.history.failed) { setTab('messages'); return; }
+  if (!older) S.history = { channel, messages: [], more: false, loading: false, failed: '' };
   const history = S.history;
   if (history.loading) return;
   const gen = S.gen; history.loading = true;
@@ -363,8 +383,11 @@ async function openHistory(channel, older = false) {
     if (gen !== S.gen || S.history !== history) return;
     history.messages = older ? history.messages.concat(res.messages) : res.messages;
     history.more = res.more;
-  } catch (e) { fail(e); }
-  finally { history.loading = false; if (S.history === history) renderMessages(); }
+  } catch (e) {
+    if (gen !== S.gen || S.history !== history) return;
+    // A failed older page keeps the shown messages, and its button retries it.
+    if (older) fail(e); else history.failed = String(e.message || e);
+  } finally { history.loading = false; if (S.history === history) renderMessages(); }
 }
 
 /* ---------- Selection model ---------- */
@@ -426,7 +449,7 @@ function renderWhere() {
   const chosen = S.servers.filter((s) => s.all || s.picked.size).length + S.dms.filter((d) => d.checked).length;
   $('whereSub').textContent = S.account ? `${chosen} selected` : '';
   if (!S.account) {
-    tree.replaceChildren(h('p', { class: 'empty' }, $('load').disabled ? 'Loading your servers and DMs…' : 'Load your account or a data package to list servers and DMs.'));
+    tree.replaceChildren(h('p', { class: 'empty' }, S.listing ? 'Loading your servers and DMs…' : 'Load your account or a data package to list servers and DMs.'));
     return;
   }
   const q = $('search').value.trim().toLowerCase();
@@ -519,7 +542,9 @@ function renderMessages() {
   if (!history) return;
   $('msgSub').textContent = (history.channel.guild_id ? '# ' : '') + channelLabel(history.channel);
   if (!history.messages.length) {
-    area.replaceChildren(h('p', { class: 'empty' }, history.loading ? 'Loading messages…' : 'This channel has no messages to show.'));
+    area.replaceChildren(history.failed && !history.loading
+      ? h('div', { class: 'empty' }, h('p', { class: 'err' }, `Cannot load these messages: ${history.failed}`), h('button', { class: 'btn', onclick: () => openHistory(history.channel) }, 'Retry'))
+      : h('p', { class: 'empty' }, history.loading ? 'Loading messages…' : 'This channel has no messages to show.'));
     return;
   }
   const anchorKey = r.anchor ? `${r.anchor.channel_id}:${r.anchor.message_id}` : null;
@@ -575,22 +600,25 @@ function renderPlan() {
   if (fresh) {
     nodes.push(h('div', { class: 'total' }, h('b', {}, p.total.toLocaleString()), h('span', { class: 'muted' }, `${p.total === 1 ? 'message' : 'messages'} in ${plural(p.channels.length, 'channel', 'channels')}. Nothing deleted yet.`)));
     if (S.mode === 'package') nodes.push(h('p', { class: 'status muted' }, 'A package cannot show pins or access, so this is a maximum.'));
+    if (p.incomplete) nodes.push(h('p', { class: 'status stale' }, p.incomplete));
     if (p.channels.length) nodes.push(h('ul', { class: 'jobs' }, p.channels.map((c) => h('li', {}, h('span', { title: c.label }, c.label), h('span', {}, c.count.toLocaleString())))));
     const noToken = !S.hasToken && !$('token').value.trim();
-    if (S.confirming) {
+    if (S.stage === Stage.Confirming || S.stage === Stage.Starting) {
+      const starting = S.stage === Stage.Starting;
       nodes.push(h('div', { class: 'confirm', role: 'alertdialog', 'aria-label': 'Confirm deletion' },
         h('strong', {}, `Delete ${plural(p.total, 'message', 'messages')} for good?`),
         h('span', {}, 'This cannot be undone. Only the previewed messages are deleted.'),
-        h('div', { class: 'btns' }, h('button', { class: 'btn danger', id: 'confirmYes', onclick: startRun }, `Delete ${p.total.toLocaleString()}`), h('button', { class: 'btn', onclick: () => { S.confirming = false; renderPlan(); } }, 'Cancel'))));
+        h('div', { class: 'btns' }, h('button', { class: 'btn danger', id: 'confirmYes', disabled: starting, onclick: startRun }, `Delete ${p.total.toLocaleString()}`), h('button', { class: 'btn', disabled: starting, onclick: () => { S.stage = Stage.Plan; renderPlan(); } }, 'Cancel'))));
     } else {
       nodes.push(h('div', { class: 'two' },
-        h('button', { class: 'btn danger', id: 'deleteBtn', disabled: !p.total || noToken, onclick: () => { S.confirming = true; renderPlan(); $('confirmYes')?.focus(); } }, p.total ? `Delete ${p.total.toLocaleString()}…` : 'Nothing to delete'),
+        h('button', { class: 'btn danger', id: 'deleteBtn', disabled: !p.total || noToken, onclick: () => { S.stage = Stage.Confirming; renderPlan(); $('confirmYes')?.focus(); } }, p.total ? `Delete ${p.total.toLocaleString()}…` : 'Nothing to delete'),
         h('button', { class: 'btn', onclick: preview }, 'Preview again')));
       if (noToken && p.total) nodes.push(h('p', { class: 'status muted' }, 'Add your token in the top bar to delete.'));
     }
   } else {
     if (p) nodes.push(h('p', { class: 'status stale' }, 'The selection changed after the preview. Preview again to see the new count.'));
-    nodes.push(h('button', { class: 'btn primary', id: 'previewBtn', disabled: S.previewing || !S.account, onclick: preview }, S.previewing ? 'Counting…' : 'Preview exact messages'));
+    const counting = S.stage === Stage.Previewing;
+    nodes.push(h('button', { class: 'btn primary', id: 'previewBtn', disabled: counting || !S.account, onclick: preview }, counting ? 'Counting…' : 'Preview exact messages'));
     if (!p && !S.error) nodes.push(h('p', { class: 'status muted' }, 'Counts what would be deleted. Nothing is deleted until you confirm.'));
   }
   act.replaceChildren(...nodes);
@@ -598,7 +626,7 @@ function renderPlan() {
 }
 
 async function preview() {
-  S.error = ''; S.previewing = true; S.confirming = false; renderPlan();
+  S.error = ''; S.stage = Stage.Previewing; renderPlan();
   const revision = S.revision;
   try {
     const res = await api('/api/preview', {
@@ -608,57 +636,69 @@ async function preview() {
     if (revision === S.revision) S.preview = { ...res, revision };
     else S.error = 'The selection changed while counting. Preview again.';
   } catch (e) { S.error = String(e.message || e); }
-  finally { S.previewing = false; renderPlan(); setTab('plan', true); }
+  finally { if (S.stage === Stage.Previewing) S.stage = Stage.Plan; renderPlan(); setTab('plan', true); }
 }
 
 /* ---------- Run ---------- */
 async function startRun() {
-  $('confirmYes').disabled = true;
+  const body = { token: $('token').value.trim(), preview_id: S.preview.preview_id, execute: true, workers: +$('workers').value, delay: +$('delay').value, jitter: +$('jitter').value };
+  S.stage = Stage.Starting; renderPlan();
   try {
-    await api('/api/run', { token: $('token').value.trim(), preview_id: S.preview.preview_id, execute: true, workers: +$('workers').value, delay: +$('delay').value, jitter: +$('jitter').value });
-    S.preview = null; S.confirming = false;
-    if (S.defaults.saves_token && $('token').value.trim()) tokenSaved();
-  } catch (e) { S.confirming = false; S.error = String(e.message || e); renderPlan(); }
+    const res = await api('/api/run', body);
+    S.preview = null; S.alreadyDone = res.already_done;
+    if (S.defaults.saves_token && body.token) tokenSaved();
+    // Enter the run view now. A run can end before the next event arrives.
+    enterRun(res.run_id);
+  } catch (e) { S.stage = Stage.Plan; S.error = String(e.message || e); renderPlan(); }
 }
 
-let paused = false;
 async function control(action) {
-  try { await api('/api/control', { action }); if (action !== 'stop') paused = action === 'pause'; }
+  try { await api('/api/control', { action }); }
   catch (e) { S.error = String(e.message || e); }
+}
+function enterRun(id) {
+  if (S.runId === id) return;
+  S.stage = Stage.Run; S.runId = id;
+  $('planBody').hidden = true; $('act').hidden = true; $('runView').hidden = false;
+  $('main').classList.add('busy'); $('where').inert = true; $('messages').inert = true; syncLoad();
+  $('planTitle').textContent = 'Starting';
+  $('runView').replaceChildren(h('p', { class: 'status muted', role: 'status' }, 'Starting the run…'));
+  setTab('plan', true);
 }
 function showRun(s) {
   const runView = $('runView');
-  if (!S.running) {
-    S.running = true; paused = false;
-    $('planBody').hidden = true; $('act').hidden = true; runView.hidden = false;
-    $('main').classList.add('busy'); $('where').inert = true; $('messages').inert = true; $('load').disabled = true;
-    setTab('plan', true);
-  }
-  $('planTitle').textContent = s.finished ? (s.aborted ? 'Stopped' : 'Finished') : paused ? 'Paused' : 'Deleting';
+  const kind = s.phase.kind, finished = FINISHED_PHASES.includes(kind);
+  $('planTitle').textContent = s.label;
   const pct = s.total > 0 ? Math.min(100, (s.processed / s.total) * 100) : 0;
   const t = (secs) => secs == null ? '—' : [Math.floor(secs / 3600), Math.floor(secs % 3600 / 60), secs % 60].map((n) => String(n).padStart(2, '0')).join(':');
   const reasons = [...(s.errors || [])];
   for (const f of s.forbidden || []) if (!reasons.some((r) => r.includes(f.reason))) reasons.push(`${f.label}: ${f.reason} (${plural(f.count, 'message', 'messages')})`);
-  runView.replaceChildren(
+  // `replaceChildren` would show a null as the text "null".
+  runView.replaceChildren(...[
     h('div', { class: 'total' }, h('b', {}, s.deleted.toLocaleString()), h('span', { class: 'muted' }, `deleted of ${s.total.toLocaleString()}`)),
     h('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(s.total), 'aria-valuenow': String(s.processed) }, h('span', { style: `width:${pct}%` })),
     h('div', { class: 'nums' },
-      ...[[s.skipped, 'skipped'], [s.failed, 'failed'], [(s.rate || 0).toFixed(2), 'per second'], [t(s.elapsed_secs), 'elapsed'], [t(s.eta_secs), 'left'], [`${s.processed}/${s.total}`, 'processed']]
+      ...[[s.skipped, 'skipped'], [s.deferred, 'deferred'], [s.failed, 'failed'], [(s.rate || 0).toFixed(2), 'per second'], [t(s.elapsed_secs), 'elapsed'], [t(s.eta_secs), 'left'], [`${s.processed}/${s.total}`, 'processed']]
         .map(([v, l]) => h('div', {}, h('b', {}, String(v)), h('span', {}, l)))),
-    h('p', { class: 'status', role: 'status' }, s.status || ''),
+    h('p', { class: 'status', role: 'status' }, s.phase.reason || s.status || ''),
+    s.limit_notice ? h('p', { class: 'status stale' }, s.limit_notice) : null,
+    S.alreadyDone ? h('p', { class: 'status muted' }, `An earlier run already deleted ${S.alreadyDone.toLocaleString()} of these messages.`) : null,
     h('div', { class: 'log' },
       (s.workers || []).map((w) => h('div', {}, `▸ ${w.channel}  ${w.done}/${w.total}`)),
       reasons.map((r) => h('div', { class: 'bad' }, r))),
-    s.finished
+    finished
       ? h('button', { class: 'btn primary', onclick: endRun }, 'New selection')
-      : h('div', { class: 'two' },
-          h('button', { class: 'btn', onclick: async () => { await control(paused ? 'resume' : 'pause'); } }, paused ? 'Continue' : 'Pause'),
-          h('button', { class: 'btn danger', onclick: () => control('stop') }, 'Stop')));
+      : kind === 'running' || kind === 'paused'
+        ? h('div', { class: 'two' },
+            h('button', { class: 'btn', onclick: () => control(kind === 'paused' ? 'resume' : 'pause') }, kind === 'paused' ? 'Continue' : 'Pause'),
+            h('button', { class: 'btn danger', onclick: () => control('stop') }, 'Stop'))
+        : null,
+  ].filter(Boolean));
 }
 function endRun() {
-  S.running = false;
+  S.stage = Stage.Plan; S.runId = null; S.alreadyDone = 0; syncLoad();
   $('planBody').hidden = false; $('act').hidden = false; $('runView').hidden = true;
-  $('main').classList.remove('busy'); $('where').inert = false; $('messages').inert = false; $('load').disabled = false;
+  $('main').classList.remove('busy'); $('where').inert = false; $('messages').inert = false;
   $('planTitle').textContent = 'Plan';
   // Deleted messages are gone: reload history and drop a range that names one.
   S.history = null; S.range = { kind: 'all', anchor: null, picked: new Map() };
@@ -670,9 +710,13 @@ function connectEvents() {
   const es = new EventSource('/api/events?session=' + encodeURIComponent(session));
   es.onmessage = (ev) => {
     let s; try { s = JSON.parse(ev.data); } catch { return; }
-    if (s.total === undefined) return;
-    // A finished run from before this page loaded is not shown again.
-    if (s.finished && !S.running) return;
+    if (s.run_id === undefined) return;
+    if (s.run_id !== S.runId) {
+      // Join an active run after a page reload. Do not show a run that ended,
+      // and do not leave the run that this page still shows.
+      if (S.runId || FINISHED_PHASES.includes(s.phase.kind)) return;
+      enterRun(s.run_id);
+    }
     showRun(s);
   };
 }

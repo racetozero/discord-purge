@@ -93,35 +93,52 @@ pub struct Options {
     pub token_store: resume::TokenStore,
 }
 
+/// A preview: what a run would delete. Only `confirm` can turn it into a run.
 #[derive(Clone)]
 pub struct PreparedRun {
     pub account_id: String,
     pub account_label: String,
     pub jobs: Vec<ChannelJob>,
     pub total: usize,
+    /// False when a search stopped before it reached the end of its results.
+    /// `search::INCOMPLETE_NOTICE` tells the user what this means.
+    pub complete: bool,
+}
+
+/// A preview checked against the signed-in account, with saved progress
+/// removed. `Engine::run` accepts only this type, and `jobs` is private, so
+/// nothing can start a deletion without the check.
+pub struct ConfirmedRun {
+    pub account_id: String,
+    pub account_label: String,
+    pub total: usize,
     pub already_done: usize,
+    pub(crate) jobs: Vec<ChannelJob>,
 }
 
 impl PreparedRun {
-    pub async fn confirm(&self, client: &api::DiscordClient) -> anyhow::Result<Self> {
+    pub async fn confirm(&self, client: &api::DiscordClient) -> anyhow::Result<ConfirmedRun> {
         let me = client.current_user().await?;
         anyhow::ensure!(
             self.account_id == api::UNKNOWN_ACCOUNT || self.account_id == me.id,
             "You changed the account after preview. Complete a new preview for this account."
         );
         let done = resume::load_done(&me.id);
-        let mut run = self.clone();
-        run.account_id = me.id.clone();
-        run.account_label = me.label();
-        run.already_done = 0;
-        for job in &mut run.jobs {
+        let mut jobs = self.jobs.clone();
+        let mut already_done = 0;
+        for job in &mut jobs {
             let count = job.items.len();
             job.items.retain(|id| !done.contains(id));
-            run.already_done += count - job.items.len();
+            already_done += count - job.items.len();
         }
-        run.jobs.retain(|job| !job.items.is_empty());
-        run.total = run.jobs.iter().map(|job| job.items.len()).sum();
-        Ok(run)
+        jobs.retain(|job| !job.items.is_empty());
+        Ok(ConfirmedRun {
+            account_id: me.id.clone(),
+            account_label: me.label(),
+            total: jobs.iter().map(|job| job.items.len()).sum(),
+            already_done,
+            jobs,
+        })
     }
 }
 
@@ -147,17 +164,20 @@ pub async fn prepare(
         client.current_user().await?
     };
 
-    let jobs: Vec<ChannelJob> = match source {
-        Source::Package(path) => package::load_ids(path, filter)?
-            .channels
-            .into_iter()
-            .map(|c| ChannelJob {
-                label: c.label(),
-                channel_id: c.id,
-                items: c.messages,
-                verified: false,
-            })
-            .collect(),
+    let search::Discovered { jobs, complete } = match source {
+        Source::Package(path) => search::Discovered {
+            jobs: package::load_ids(path, filter)?
+                .channels
+                .into_iter()
+                .map(|c| ChannelJob {
+                    label: c.label(),
+                    channel_id: c.id,
+                    items: c.messages,
+                    verified: false,
+                })
+                .collect(),
+            complete: true,
+        },
         Source::Selected { selection, package } => {
             selection::discover(client, selection, package.as_deref(), &me.id, filter).await?
         }
@@ -176,6 +196,6 @@ pub async fn prepare(
         account_label: me.label(),
         jobs,
         total,
-        already_done: 0,
+        complete,
     })
 }

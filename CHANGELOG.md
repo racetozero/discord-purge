@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Added
+
+- A run now shows when it is paused and when it is stopping, in the terminal UI
+  and in the web panel. A web page that you reload during a pause still shows
+  the pause.
+- A new `deferred` count shows messages that a later run can delete, for example
+  after you get access to a channel again. `skipped` now counts only messages
+  that no retry can delete.
+- A preview now tells you when Discord's search stopped early, because its count
+  can then be too low.
+- You can retry a channel history that did not load.
+- Run screens and reports now tell you when repeated shared or global rate limits
+  limited a run to one request at a time.
+
+### Changed
+
+- A plain `--execute` run now exits with an error when messages remain to retry.
+- Reports and screens now separate a stop that you asked for from a failure, and
+  they give the reason for the failure.
+- `--execute` or `--report` without `--no-tui` is now an error. So is `--web` with
+  `--no-tui`. Before this change, the app ignored these options.
+
+### Fixed
+
+- The web panel no longer stays on the confirmation when a run ends immediately.
+- Enter in the web panel's token field no longer clears the selection during a
+  run.
+- After Discord rejects a token, the next delete asks for a new token.
+- All requests for one token now share one rate-limit state. Before this change,
+  each browse action kept its own state.
+- A finished preview no longer closes a form that you opened in the terminal UI.
+- If the selection changes during the start check, the terminal UI starts no
+  run and tells you to preview again.
+- In the terminal UI's delete form, a pasted token now always goes to the token
+  field.
+
 ## 0.0.1 - 2026-11-05
 
 The first public release.
