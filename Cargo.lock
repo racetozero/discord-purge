@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "discord-purge"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "discord-purge-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "discord-purge-tui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "discord-purge-web"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "axum",

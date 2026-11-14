@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.3 - 2026-11-14
+
 ### Fixed
 
 - A large `messages.json` file no longer fails with "the message array is
