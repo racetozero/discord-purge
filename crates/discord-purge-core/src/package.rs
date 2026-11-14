@@ -33,6 +33,26 @@ use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use crate::filter::{Filter, Kind, attachment_kind, classify, classify_parts};
 use crate::selection::parse_id;
 
+/// Message IDs from the user's own package, so a fast multiply-fold hash
+/// replaces SipHash in the set that removes duplicates.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("IdHasher hashes only u64 message IDs")
+    }
+    fn write_u64(&mut self, id: u64) {
+        let product = u128::from(id) * 0x9E37_79B9_7F4A_7C15;
+        self.0 = product as u64 ^ (product >> 64) as u64;
+    }
+}
+
+type IdSet = HashSet<u64, std::hash::BuildHasherDefault<IdHasher>>;
+
 const MAX_FILE: u64 = 256 * 1024 * 1024;
 const TOO_LARGE: &str = "A package message file is larger than 256 MiB. Split the extracted message files before you retry.";
 
@@ -40,7 +60,6 @@ const TOO_LARGE: &str = "A package message file is larger than 256 MiB. Split th
 pub struct PkgMessage {
     pub id: String,
     pub content: String,
-    pub kind: Kind,
 }
 
 /// One channel loaded from the package. `M` is a full message for browsing,
@@ -66,17 +85,6 @@ impl<M> RawChannel<M> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LoadedPackage<M = PkgMessage> {
-    pub channels: Vec<RawChannel<M>>,
-}
-
-impl<M> LoadedPackage<M> {
-    pub fn total_messages(&self) -> usize {
-        self.channels.iter().map(|c| c.messages.len()).sum()
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct ChannelJson {
     #[serde(default, alias = "ID")]
@@ -89,49 +97,50 @@ struct ChannelJson {
     guild: Option<serde_json::Value>,
 }
 
-pub fn load(path: &Path, filter: &Filter) -> anyhow::Result<LoadedPackage> {
-    scan(path, filter, |id, content, kind| PkgMessage {
-        id: id.to_string(),
-        content: content.to_owned(),
-        kind,
-    })
-}
-
-/// Like `load`, but keep only the IDs of matching messages. Previews and runs
-/// need no message text, so this uses much less memory.
-pub fn load_ids(path: &Path, filter: &Filter) -> anyhow::Result<LoadedPackage<u64>> {
-    scan(path, filter, |id, _, _| id)
-}
-
-/// Load one channel with message text. Only that channel's message file is
-/// parsed, so browsing a page of history does not read the whole package.
-pub fn load_channel(path: &Path, channel_id: &str) -> anyhow::Result<LoadedPackage> {
-    scan_where(
+pub fn load(path: &Path, filter: &Filter) -> anyhow::Result<Vec<RawChannel>> {
+    scan(
         path,
-        &Filter::default(),
-        |id| id == channel_id,
-        |id, content, kind| PkgMessage {
+        filter,
+        |_| true,
+        |id, content, _| PkgMessage {
             id: id.to_string(),
             content: content.to_owned(),
-            kind,
         },
     )
 }
 
-pub fn scan<M>(
-    path: &Path,
-    filter: &Filter,
-    keep: impl FnMut(u64, &str, Kind) -> M,
-) -> anyhow::Result<LoadedPackage<M>> {
-    scan_where(path, filter, |_| true, keep)
+/// Like `load`, but keep only the IDs of matching messages. Previews and runs
+/// need no message text, so this uses much less memory.
+pub fn load_ids(path: &Path, filter: &Filter) -> anyhow::Result<Vec<RawChannel<u64>>> {
+    scan(path, filter, |_| true, |id, _, _| id)
 }
 
-fn scan_where<M>(
+/// Load one channel with message text. Only that channel's message file is
+/// parsed, so browsing a page of history does not read the whole package.
+pub fn load_channel(path: &Path, channel_id: &str) -> anyhow::Result<RawChannel> {
+    scan(
+        path,
+        &Filter::default(),
+        |channel| channel.id == channel_id,
+        |id, content, _| PkgMessage {
+            id: id.to_string(),
+            content: content.to_owned(),
+        },
+    )?
+    .into_iter()
+    .next()
+    .context("The channel is not in this package. Select a listed channel and retry.")
+}
+
+/// Parse the message files of the channels that `wanted` accepts. `wanted`
+/// gets each channel before its messages are read, so other channels cost
+/// only their small `channel.json`.
+pub(crate) fn scan<M>(
     path: &Path,
     filter: &Filter,
-    wanted: impl Fn(&str) -> bool,
+    wanted: impl Fn(&RawChannel<M>) -> bool,
     mut keep: impl FnMut(u64, &str, Kind) -> M,
-) -> anyhow::Result<LoadedPackage<M>> {
+) -> anyhow::Result<Vec<RawChannel<M>>> {
     let mut files = PackageFiles::open(path)?;
     let index: BTreeMap<String, String> = match files.index.take() {
         Some(entry) => serde_json::from_slice(&files.read(&entry)?).unwrap_or_default(),
@@ -147,7 +156,7 @@ fn scan_where<M>(
 
     // Read one channel's files at a time, so only one message file is in
     // memory. Duplicate IDs keep their first occurrence across the package.
-    let mut seen = HashSet::new();
+    let mut seen = IdSet::default();
     let mut channels = Vec::new();
     for (directory, folder) in std::mem::take(&mut files.folders) {
         let (mut channel_id, mut channel_name, mut guild_id, mut guild_name) =
@@ -182,33 +191,31 @@ fn scan_where<M>(
             }
             guild_name = g;
         }
-        is_dm = guild_id.is_empty() && guild_name.is_empty();
-        if !wanted(&channel_id) {
+        let mut channel = RawChannel {
+            is_dm: guild_id.is_empty() && guild_name.is_empty(),
+            id: channel_id,
+            name: channel_name,
+            guild_id,
+            guild_name,
+            messages: Vec::new(),
+        };
+        if !wanted(&channel) {
             continue;
         }
-
-        let kept = if let Some(entry) = &folder.messages_json {
+        channel.messages = if let Some(entry) = &folder.messages_json {
             parse_messages_json(files.open_file(entry)?.1, filter, &mut seen, &mut keep)?
         } else if let Some(entry) = &folder.messages_csv {
             parse_messages_csv(files.open_file(entry)?.1, filter, &mut seen, &mut keep)?
         } else {
             continue;
         };
-        if kept.is_empty() {
-            continue;
+        if !channel.messages.is_empty() {
+            channels.push(channel);
         }
-        channels.push(RawChannel {
-            id: channel_id,
-            name: channel_name,
-            guild_id,
-            guild_name,
-            is_dm,
-            messages: kept,
-        });
     }
 
     channels.sort_by_cached_key(RawChannel::label);
-    Ok(LoadedPackage { channels })
+    Ok(channels)
 }
 
 enum Entry {
@@ -364,8 +371,7 @@ fn parent_dir(path: &str) -> &str {
 fn is_dm_type(kind: Option<&serde_json::Value>) -> bool {
     match kind {
         Some(serde_json::Value::String(s)) => {
-            let s = s.to_ascii_uppercase();
-            s == "DM" || s == "GROUP_DM"
+            s.eq_ignore_ascii_case("DM") || s.eq_ignore_ascii_case("GROUP_DM")
         }
         // Numeric channel types: 1 = DM, 3 = GROUP_DM.
         Some(serde_json::Value::Number(n)) => {
@@ -591,9 +597,9 @@ impl<'de> Deserialize<'de> for UrlKey {
 /// only the rows that pass the filter. The file is read in 1 MiB parts, so
 /// memory use does not grow with the file size.
 fn parse_messages_json<M>(
-    mut input: impl Read,
+    reader: impl Read,
     filter: &Filter,
-    seen: &mut HashSet<u64>,
+    seen: &mut IdSet,
     keep: &mut impl FnMut(u64, &str, Kind) -> M,
 ) -> anyhow::Result<Vec<M>> {
     let invalid = |detail: &dyn std::fmt::Display| {
@@ -601,51 +607,63 @@ fn parse_messages_json<M>(
             "The message JSON is invalid: {detail}. Use an unmodified Discord data package."
         )
     };
-    let (mut buffer, mut position) = (Vec::with_capacity(CHUNK), 0);
+    let mut input = JsonInput {
+        reader,
+        text: String::with_capacity(CHUNK),
+        position: 0,
+        cut: Vec::with_capacity(CHUNK),
+    };
     let mut out = Vec::new();
-    if next_token(&mut input, &mut buffer, &mut position)? != Some(b'[') {
+    if input.next_token()? != Some(b'[') {
         return Err(invalid(&"it is not an array of message objects"));
     }
-    position += 1;
-    if next_token(&mut input, &mut buffer, &mut position)? == Some(b']') {
-        position += 1;
+    input.position += 1;
+    if input.next_token()? == Some(b']') {
+        input.position += 1;
     } else {
         loop {
-            // Parse one row from the buffer. A row cut at the end of the
-            // buffer is parsed again after more of the file is read.
+            // Parse one row from the text. A row cut at the end of the text
+            // is parsed again after more of the file is read.
             loop {
-                let mut rows =
-                    serde_json::Deserializer::from_slice(&buffer[position..]).into_iter::<Row>();
+                // The text is checked UTF-8, so `from_str` does not check
+                // each string again.
+                let mut rows = serde_json::Deserializer::from_str(&input.text[input.position..])
+                    .into_iter::<Row>();
                 match rows.next() {
                     Some(Ok(row)) => {
                         let end = rows.byte_offset();
                         let kind = classify_parts(&row.content, row.attachments.0);
-                        if seen.insert(row.id) && filter.keep_id(row.id, &row.content, kind) {
+                        if seen.insert(row.id) && filter.keep(row.id, &row.content, kind) {
                             out.push(keep(row.id, &row.content, kind));
                         }
-                        position += end;
+                        input.position += end;
                         break;
                     }
                     Some(Err(error)) if error.is_eof() => {
-                        if !refill(&mut input, &mut buffer, &mut position)? {
+                        if !input.refill()? {
                             return Err(invalid(&error));
                         }
                     }
+                    // The text ended between a comma and the next row.
+                    None => {
+                        if !input.refill()? {
+                            return Err(invalid(&"the message array is incomplete"));
+                        }
+                    }
                     Some(Err(error)) => return Err(invalid(&error)),
-                    None => return Err(invalid(&"the message array is incomplete")),
                 }
             }
-            match next_token(&mut input, &mut buffer, &mut position)? {
-                Some(b',') => position += 1,
+            match input.next_token()? {
+                Some(b',') => input.position += 1,
                 Some(b']') => {
-                    position += 1;
+                    input.position += 1;
                     break;
                 }
                 _ => return Err(invalid(&"messages must be separated by commas")),
             }
         }
     }
-    if next_token(&mut input, &mut buffer, &mut position)?.is_some() {
+    if input.next_token()?.is_some() {
         return Err(invalid(&"there is text after the message array"));
     }
     Ok(out)
@@ -653,40 +671,62 @@ fn parse_messages_json<M>(
 
 const CHUNK: usize = 1 << 20;
 
-fn next_token(
-    input: &mut impl Read,
-    buffer: &mut Vec<u8>,
-    position: &mut usize,
-) -> anyhow::Result<Option<u8>> {
-    loop {
-        while let Some(&byte) = buffer.get(*position) {
-            if !byte.is_ascii_whitespace() {
-                return Ok(Some(byte));
-            }
-            *position += 1;
-        }
-        if !refill(input, buffer, position)? {
-            return Ok(None);
-        }
-    }
+/// A message file read in parts. `text` holds checked UTF-8 that is parsed
+/// from `position`, and `cut` holds the bytes of a character that the last
+/// read split.
+struct JsonInput<R> {
+    reader: R,
+    text: String,
+    position: usize,
+    cut: Vec<u8>,
 }
 
-fn refill(
-    input: &mut impl Read,
-    buffer: &mut Vec<u8>,
-    position: &mut usize,
-) -> anyhow::Result<bool> {
-    buffer.drain(..*position);
-    *position = 0;
-    anyhow::ensure!(
-        buffer.len() <= 16 * CHUNK,
-        "A message in the package is larger than 16 MiB. Use an unmodified Discord data package."
-    );
-    let filled = buffer.len();
-    buffer.resize(filled + CHUNK, 0);
-    let read = input.read(&mut buffer[filled..])?;
-    buffer.truncate(filled + read);
-    Ok(read > 0)
+impl<R: Read> JsonInput<R> {
+    /// The next byte that is not white space, or `None` at the end of the file.
+    fn next_token(&mut self) -> anyhow::Result<Option<u8>> {
+        loop {
+            let rest = &self.text.as_bytes()[self.position..];
+            if let Some(skip) = rest.iter().position(|byte| !byte.is_ascii_whitespace()) {
+                self.position += skip;
+                return Ok(Some(rest[skip]));
+            }
+            self.position = self.text.len();
+            if !self.refill()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Read the next part of the file. Returns false at the end of the file.
+    fn refill(&mut self) -> anyhow::Result<bool> {
+        self.text.drain(..self.position);
+        self.position = 0;
+        anyhow::ensure!(
+            self.text.len() <= 16 * CHUNK,
+            "A message in the package is larger than 16 MiB. Use an unmodified Discord data package."
+        );
+        let kept = self.cut.len();
+        self.cut.resize(kept + CHUNK, 0);
+        let read = self.reader.read(&mut self.cut[kept..])?;
+        self.cut.truncate(kept + read);
+        let end = match std::str::from_utf8(&self.cut) {
+            Ok(text) => {
+                self.text.push_str(text);
+                text.len()
+            }
+            // A character cut at the end of this read completes in the next one.
+            Err(error) if error.error_len().is_none() && read > 0 => {
+                let end = error.valid_up_to();
+                self.text.push_str(std::str::from_utf8(&self.cut[..end])?);
+                end
+            }
+            Err(_) => anyhow::bail!(
+                "The message JSON is not valid UTF-8 text. Use an unmodified Discord data package."
+            ),
+        };
+        self.cut.drain(..end);
+        Ok(read > 0)
+    }
 }
 
 /// Parse the legacy `messages.csv` (header row then rows). The columns are
@@ -695,7 +735,7 @@ fn refill(
 fn parse_messages_csv<M>(
     data: impl Read,
     filter: &Filter,
-    seen: &mut HashSet<u64>,
+    seen: &mut IdSet,
     keep: &mut impl FnMut(u64, &str, Kind) -> M,
 ) -> anyhow::Result<Vec<M>> {
     let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(data);
@@ -708,10 +748,9 @@ fn parse_messages_csv<M>(
         })?
         .clone();
     let column = |want: &[&str]| -> Option<usize> {
-        headers.iter().position(|header| {
-            let header = header.to_ascii_lowercase();
-            want.iter().any(|w| header == *w)
-        })
+        headers
+            .iter()
+            .position(|header| want.iter().any(|w| header.eq_ignore_ascii_case(w)))
     };
     let id_col = match column(&["id"]) {
         Some(c) => c,
@@ -734,7 +773,7 @@ fn parse_messages_csv<M>(
         let content = content_col.and_then(|c| record.get(c)).unwrap_or("");
         let attachments = attachment_column.and_then(|c| record.get(c)).unwrap_or("");
         let kind = classify(content, attachments.split_whitespace());
-        if seen.insert(id) && filter.keep_id(id, content, kind) {
+        if seen.insert(id) && filter.keep(id, content, kind) {
             out.push(keep(id, content, kind));
         }
     }
@@ -745,6 +784,10 @@ fn parse_messages_csv<M>(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn total(channels: &[RawChannel]) -> usize {
+        channels.iter().map(|c| c.messages.len()).sum()
+    }
 
     fn write_zip() -> tempfile::NamedTempFile {
         let f = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
@@ -769,8 +812,8 @@ mod tests {
     fn loads_messages_from_zip() {
         let f = write_zip();
         let pkg = load(f.path(), &Filter::default()).unwrap();
-        assert_eq!(pkg.channels.len(), 1);
-        let c = &pkg.channels[0];
+        assert_eq!(pkg.len(), 1);
+        let c = &pkg[0];
         assert_eq!(c.id, "111");
         assert_eq!(c.guild_name, "My Server");
         assert_eq!(c.guild_id, "900");
@@ -787,7 +830,7 @@ mod tests {
             ..Default::default()
         };
         let pkg = load(f.path(), &filter).unwrap();
-        assert_eq!(pkg.total_messages(), 1);
+        assert_eq!(total(&pkg), 1);
     }
     #[test]
     fn extracted_messages_folder_rejects_malformed_rows_and_removes_duplicates() {
@@ -804,7 +847,7 @@ mod tests {
         );
         std::fs::write(&path, br#"[{"ID":"175928847299117063","Contents":"first"},{"ID":"175928847299117063","Contents":"duplicate"}]"#).unwrap();
         let package = load(&root.path().join("messages"), &Filter::default()).unwrap();
-        assert_eq!(package.total_messages(), 1);
+        assert_eq!(total(&package), 1);
         std::fs::write(&path, br#"[{"ID":"../invalid","Contents":"bad ID"}]"#).unwrap();
         assert!(load(root.path(), &Filter::default()).is_err());
     }
@@ -824,12 +867,45 @@ mod tests {
         );
         std::fs::write(folder.join("messages.json"), json).unwrap();
         let package = load(root.path(), &Filter::default()).unwrap();
-        let messages = &package.channels[0].messages;
+        let messages = &package[0].messages;
         assert_eq!(messages.len(), 12_000);
         for (i, message) in (1..).zip(messages) {
             assert_eq!(message.id, (175928847299117063 + i).to_string());
             assert_eq!(message.content, text(i));
         }
+    }
+
+    #[test]
+    fn rows_split_at_every_byte_still_parse() {
+        // Each read returns one byte, so every row and separator crosses a
+        // read boundary.
+        struct OneByte<'a>(&'a [u8]);
+        impl Read for OneByte<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let Some((&byte, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                (out[0], self.0) = (byte, rest);
+                Ok(1)
+            }
+        }
+        let json = r#"[ {"ID":"175928847299117063","Contents":"a"} ,
+            {"ID":"175928847299117064","Contents":"✓ b"},{"ID":"175928847299117065"} ]"#;
+        let ids = parse_messages_json(
+            OneByte(json.as_bytes()),
+            &Filter::default(),
+            &mut IdSet::default(),
+            &mut |id, content, _| (id, content.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            ids,
+            [
+                (175928847299117063, "a".to_owned()),
+                (175928847299117064, "✓ b".to_owned()),
+                (175928847299117065, String::new())
+            ]
+        );
     }
 
     #[test]
@@ -844,15 +920,17 @@ mod tests {
             {"Id":"175928847299117063","Content":"duplicate","Attachment":"https://cdn.example/other.png"}
         ]"#).unwrap();
         let package = load(root.path(), &Filter::default()).unwrap();
-        assert_eq!(package.total_messages(), 2);
-        assert_eq!(package.channels[0].messages[1].content, "line\ntext");
-        assert!(package.channels[0].messages[0].kind.contains(Kind::IMAGE));
-        assert!(package.channels[0].messages[1].kind.contains(Kind::AUDIO));
-        let filter = Filter {
-            types: Kind::IMAGE,
+        assert_eq!(total(&package), 2);
+        assert_eq!(package[0].messages[1].content, "line\ntext");
+        let only = |types| Filter {
+            types,
             ..Default::default()
         };
-        assert_eq!(load(root.path(), &filter).unwrap().total_messages(), 1);
+        let audio = load(root.path(), &only(Kind::AUDIO)).unwrap();
+        assert_eq!(audio[0].messages[0].content, "line\ntext");
+        let filter = only(Kind::IMAGE);
+        let images = load(root.path(), &filter).unwrap();
+        assert_eq!(images[0].messages[0].content, "first");
         for invalid in [
             r#"[{"ID":"175928847299117064","Contents":"filtered"},{"ID":"bad"}]"#,
             r#"[{"ID":"175928847299117064","Contents":"filtered"}] trailing"#,
@@ -864,10 +942,17 @@ mod tests {
                 "filters must not hide invalid trailing input"
             );
         }
+        for invalid_utf8 in [
+            &b"[{\"ID\":\"175928847299117064\",\"Contents\":\"\xff\"}]"[..],
+            b"[\xe2\x9c",
+        ] {
+            std::fs::write(&path, invalid_utf8).unwrap();
+            assert!(load(root.path(), &filter).is_err());
+        }
         std::fs::remove_file(&path).unwrap();
         let csv = folder.join("messages.csv");
         std::fs::write(&csv, "ID,Timestamp,Contents,Attachments\n175928847299117063,,first,https://cdn.example/photo.png\n175928847299117064,,filtered,\n175928847299117063,,duplicate,https://cdn.example/other.png\n").unwrap();
-        assert_eq!(load(root.path(), &filter).unwrap().total_messages(), 1);
+        assert_eq!(total(&load(root.path(), &filter).unwrap()), 1);
         std::fs::write(
             &csv,
             "ID,Contents,Attachments\n175928847299117064,filtered,\nbad,invalid,\n",

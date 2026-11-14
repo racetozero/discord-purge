@@ -18,13 +18,12 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, Stream};
-use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use discord_purge_core::api::{DEFAULT_BASE, DiscordClient, TokenRejected};
-use discord_purge_core::engine::{Controls, Engine, EngineConfig, Stats};
+use discord_purge_core::engine::{Controls, EngineConfig};
 use discord_purge_core::search::INCOMPLETE_NOTICE;
 use discord_purge_core::selection::{self, Selection};
 use discord_purge_core::{Options, PreparedRun, Source, prepare, resume};
@@ -33,7 +32,6 @@ struct Live {
     /// Names this run in `/api/run` and in each event, so the page can tell its
     /// own run from an earlier one.
     id: String,
-    stats: Arc<Stats>,
     controls: Controls,
     account: String,
 }
@@ -60,7 +58,7 @@ impl AppState {
             .lock()
             .await
             .as_ref()
-            .is_some_and(|run| !run.stats.is_finished())
+            .is_some_and(|run| !run.controls.stats().is_finished())
     }
 
     /// Allow one preview or run preparation at a time, and none during a run.
@@ -108,7 +106,7 @@ impl AppState {
 pub async fn serve(config: Options, port: u16) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let port = listener.local_addr()?.port();
-    let session = format!("{:032x}", rand::thread_rng().r#gen::<u128>());
+    let session = format!("{:032x}", rand::random::<u128>());
     let cfg_store = config.token_store;
     let state = Arc::new(AppState {
         defaults: config,
@@ -169,9 +167,7 @@ async fn protect(
         .get("origin")
         .and_then(|v| v.to_str().ok());
     let expected_origin = format!("http://{}", state.host);
-    if host != Some(state.host.as_str())
-        || origin.is_some_and(|other_origin| other_origin != expected_origin)
-    {
+    if host != Some(state.host.as_str()) || origin.is_some_and(|origin| origin != expected_origin) {
         return (
             StatusCode::FORBIDDEN,
             "Use the local panel URL printed by this app.",
@@ -401,7 +397,7 @@ async fn preview(State(state): State<Arc<AppState>>, Json(request): Json<Preview
     let run = prepare(&client, &source, &filter)
         .await
         .map_err(ApiError::from_account)?;
-    let preview_id = format!("{:032x}", rand::thread_rng().r#gen::<u128>());
+    let preview_id = format!("{:032x}", rand::random::<u128>());
     let channels: Vec<_> = run
         .jobs
         .iter()
@@ -411,7 +407,7 @@ async fn preview(State(state): State<Arc<AppState>>, Json(request): Json<Preview
     let response = Json(json!({
         "ok": true,
         "account": run.account_label,
-        "total": run.total,
+        "total": run.total(),
         "channels": channels,
         "preview_id": preview_id,
         "scope": scope,
@@ -467,25 +463,20 @@ async fn run_handler(State(state): State<Arc<AppState>>, Json(request): Json<Run
         .await
         .map_err(ApiError::from_account)?;
     state.remember(&token);
-    let log = resume::ResumeLog::open(&run.account_id).map_err(|error| {
-        format!("Cannot open the resume log: {error}. Check state directory permissions and retry.")
-    })?;
-    preview.take();
     let (total, already_done) = (run.total, run.already_done);
     let account = run.account_label.clone();
-    let run_id = format!("{:032x}", rand::thread_rng().r#gen::<u128>());
-    let stats = Stats::new(total, settings.workers);
-    let (engine, controls) = Engine::new(settings, client, stats.clone());
+    // A failed start keeps the preview, so the user can retry it.
+    let handle = run.start(settings, client, None)?;
+    preview.take();
+    let run_id = format!("{:032x}", rand::random::<u128>());
     *state.live.lock().await = Some(Live {
         id: run_id.clone(),
-        stats: stats.clone(),
-        controls,
-        account: account.clone(),
+        controls: handle.controls,
+        account,
     });
     tokio::spawn(async move {
-        engine.run(run, move |key| log.record(key)).await;
-        if let Err(error) = resume::write_report(&account, &stats.snapshot(), None) {
-            eprintln!("Cannot write the report: {error}. Check state directory permissions.");
+        if let Ok(Err(error)) = handle.task.await {
+            eprintln!("Cannot write the report: {error}");
         }
     });
     Ok(Json(json!({
@@ -504,7 +495,7 @@ async fn control(State(state): State<Arc<AppState>>, Json(request): Json<Control
     let run = live
         .as_ref()
         .ok_or("You sent a run action, but no run exists. Start a run first.")?;
-    if run.stats.is_finished() {
+    if run.controls.stats().is_finished() {
         return Err(
             "You sent a run action, but this run has ended. Select New selection to start another run."
                 .into(),
@@ -522,7 +513,7 @@ async fn control(State(state): State<Arc<AppState>>, Json(request): Json<Control
 }
 
 fn snapshot_json(run: &Live) -> serde_json::Value {
-    let snapshot = run.stats.snapshot();
+    let snapshot = run.controls.stats().snapshot();
     json!({
         "run_id": run.id,
         "account": run.account,
@@ -543,9 +534,7 @@ fn snapshot_json(run: &Live) -> serde_json::Value {
             "channel": worker.channel, "done": worker.done, "total": worker.total
         })).collect::<Vec<_>>(),
         "errors": snapshot.errors.iter().rev().take(8).cloned().collect::<Vec<_>>(),
-        "forbidden": snapshot.forbidden.iter().map(|f| json!({
-            "label": f.label, "count": f.count, "reason": f.reason
-        })).collect::<Vec<_>>(),
+        "forbidden": snapshot.forbidden,
     })
 }
 
@@ -567,6 +556,7 @@ async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use discord_purge_core::engine::Engine;
     use discord_purge_core::filter::Filter;
 
     #[tokio::test]
@@ -808,15 +798,13 @@ mod tests {
             400,
             "an empty selection must never expand to all messages"
         );
-        let stats = Stats::new(1, 1);
         let (_, controls) = Engine::new(
             EngineConfig::default(),
             DiscordClient::with_base("", "http://127.0.0.1:1").unwrap(),
-            stats.clone(),
+            1,
         );
         *state.live.lock().await = Some(Live {
             id: "test-run".into(),
-            stats,
             controls,
             account: "offline fixture".into(),
         });
@@ -1003,15 +991,13 @@ mod tests {
         assert!(refused["error"].as_str().unwrap().contains("has ended"));
 
         // A page that loads during a pause must see the pause.
-        let stats = Stats::new(1, 1);
         let (_, controls) = Engine::new(
             EngineConfig::default(),
             DiscordClient::with_base("", "http://127.0.0.1:1").unwrap(),
-            stats.clone(),
+            1,
         );
         *state.live.lock().await = Some(Live {
             id: "active".into(),
-            stats,
             controls,
             account: "fixture".into(),
         });

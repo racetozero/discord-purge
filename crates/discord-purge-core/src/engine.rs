@@ -170,7 +170,7 @@ pub struct WorkerStatus {
     pub total: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ForbiddenStat {
     pub count: usize,
     pub reason: String,
@@ -271,72 +271,45 @@ impl Stats {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .phase
-            .is_finished()
+        crate::lock(&self.inner).phase.is_finished()
     }
 
     fn is_halted(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .phase
-            .is_halted()
+        crate::lock(&self.inner).phase.is_halted()
     }
 
     fn is_paused(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .phase
-            == RunPhase::Paused
+        crate::lock(&self.inner).phase == RunPhase::Paused
     }
 
     fn apply(&self, event: RunEvent) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.inner);
         let phase = std::mem::replace(&mut guard.phase, RunPhase::Running);
         guard.phase = phase.next(event);
     }
 
     fn set_worker(&self, index: usize, status: WorkerStatus) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.inner);
         if let Some(slot) = guard.workers.get_mut(index) {
             *slot = status;
         }
     }
 
     fn set_status(&self, line: impl Into<String>) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.inner);
         guard.status = line.into();
         guard.status_until = None;
     }
 
     /// Show a line only for the wait that it describes.
     fn set_wait_status(&self, line: impl Into<String>, wait: Duration) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.inner);
         guard.status = line.into();
         guard.status_until = Some(Instant::now() + wait);
     }
 
     fn log_error(&self, line: impl Into<String>) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.inner);
         guard.errors.push(line.into());
         let len = guard.errors.len();
         if len > 200 {
@@ -345,10 +318,7 @@ impl Stats {
     }
 
     fn log_forbidden(&self, channel_id: &str, label: &str, reason: &str) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.inner);
         let entry = guard.forbidden.entry(channel_id.to_string()).or_default();
         entry.count += 1;
         if entry.reason.is_empty() {
@@ -378,10 +348,7 @@ impl Stats {
         } else {
             None
         };
-        let guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = crate::lock(&self.inner);
         let wait_ended = guard
             .status_until
             .is_some_and(|until| until <= Instant::now());
@@ -414,17 +381,17 @@ struct Control {
     /// parks every worker here.
     pause_until_ms: AtomicU64,
     epoch: Instant,
-    active_limit: AtomicI64,
     in_flight: AtomicI64,
-    collapse_score: AtomicI64,
+    /// Shared or global 429s so far in this run.
+    shared_limits: AtomicI64,
     /// Rolling list of invalid-response timestamps (ms since epoch) for the
     /// Cloudflare budget.
     cloudflare_times: Mutex<Vec<u64>>,
     blocked_channels: Mutex<std::collections::HashSet<String>>,
 }
 
-const COLLAPSE_THRESHOLD: i64 = 4;
-const COLLAPSE_PENALTY: i64 = 2;
+/// The shared or global 429 that limits the run to one request at a time.
+const COLLAPSE_AFTER: i64 = 2;
 const CF_WINDOW: Duration = Duration::from_secs(600);
 const CF_PAUSE_AT: usize = 9500;
 const CF_RESUME_AT: usize = 9000;
@@ -435,13 +402,12 @@ const ADAPTIVE_CEIL_MAX: Duration = Duration::from_secs(30);
 const ADAPTIVE_RECOVER: f64 = 0.2;
 
 impl Control {
-    fn new(workers: usize) -> Self {
+    fn new() -> Self {
         Self {
             pause_until_ms: AtomicU64::new(0),
             epoch: Instant::now(),
-            active_limit: AtomicI64::new(workers as i64),
             in_flight: AtomicI64::new(0),
-            collapse_score: AtomicI64::new(0),
+            shared_limits: AtomicI64::new(0),
             cloudflare_times: Mutex::new(Vec::new()),
             blocked_channels: Mutex::new(std::collections::HashSet::new()),
         }
@@ -464,10 +430,7 @@ impl Control {
 
     fn cloudflare_record(&self) {
         let now = self.now_ms();
-        let mut guard = self
-            .cloudflare_times
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.cloudflare_times);
         guard.push(now);
         let cutoff = now.saturating_sub(CF_WINDOW.as_millis() as u64);
         guard.retain(|time| *time >= cutoff);
@@ -475,10 +438,7 @@ impl Control {
 
     fn cloudflare_wait(&self) -> Option<Duration> {
         let now = self.now_ms();
-        let mut guard = self
-            .cloudflare_times
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::lock(&self.cloudflare_times);
         let cutoff = now.saturating_sub(CF_WINDOW.as_millis() as u64);
         guard.retain(|time| *time >= cutoff);
         let count = guard.len();
@@ -505,6 +465,10 @@ pub struct Controls {
 }
 
 impl Controls {
+    /// The progress of the run that these controls drive.
+    pub fn stats(&self) -> &Arc<Stats> {
+        &self.stats
+    }
     pub fn pause(&self) {
         self.stats.apply(RunEvent::Pause);
     }
@@ -528,8 +492,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(config: EngineConfig, client: DiscordClient, stats: Arc<Stats>) -> (Self, Controls) {
-        let control = Arc::new(Control::new(config.workers));
+    /// An engine for a run of `total` messages, and the controls that pause,
+    /// stop, and read its progress.
+    pub fn new(config: EngineConfig, client: DiscordClient, total: usize) -> (Self, Controls) {
+        let stats = Stats::new(total, config.workers);
+        let control = Arc::new(Control::new());
         let controls = Controls {
             stats: stats.clone(),
         };
@@ -562,11 +529,7 @@ impl Engine {
                 let on_done = on_done.clone();
                 async move {
                     loop {
-                        let Some(job) = queue
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .next()
-                        else {
+                        let Some(job) = crate::lock(&queue).next() else {
                             break;
                         };
                         if this.stats.is_halted() {
@@ -607,13 +570,7 @@ impl Engine {
             );
             let throttled = self.delete_one(&job, message_id, &on_done).await;
             current_delay = adapt_spacing(current_delay, self.config.delay, throttled);
-            if self
-                .control
-                .blocked_channels
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&job.channel_id)
-            {
+            if crate::lock(&self.control.blocked_channels).contains(&job.channel_id) {
                 // No more requests can be made for this channel in this run.
                 // Account for the remaining items without sleeping between them.
                 let remaining = total - index - 1;
@@ -662,13 +619,7 @@ impl Engine {
                     return throttled;
                 }
             }
-            if self
-                .control
-                .blocked_channels
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(channel_id)
-            {
+            if crate::lock(&self.control.blocked_channels).contains(channel_id) {
                 self.stats.add_deferred();
                 return throttled;
             }
@@ -676,7 +627,7 @@ impl Engine {
             // finish its channel after the request limit becomes one.
             let permit = loop {
                 let active = self.control.in_flight.load(Ordering::SeqCst);
-                let limit = self.control.active_limit.load(Ordering::SeqCst);
+                let limit = self.stats.active_limit.load(Ordering::SeqCst);
                 if active < limit
                     && self
                         .control
@@ -718,29 +669,21 @@ impl Engine {
                     if scope == Scope::Global {
                         self.control.pause_global(retry_after);
                     }
-                    if scope.should_reduce_concurrency() {
+                    if scope != Scope::User {
                         self.collapse_if_needed();
-                        self.stats.set_wait_status(
-                            format!(
-                                "{} rate limit on {label}; easing off {:.1}s",
-                                if scope == Scope::Global {
-                                    "global"
-                                } else {
-                                    "shared"
-                                },
-                                retry_after.as_secs_f64()
-                            ),
-                            retry_after,
-                        );
-                    } else {
-                        self.stats.set_wait_status(
-                            format!(
-                                "rate limited on {label}; easing off {:.1}s",
-                                retry_after.as_secs_f64()
-                            ),
-                            retry_after,
-                        );
                     }
+                    let limit = match scope {
+                        Scope::Global => "global rate limit",
+                        Scope::Shared => "shared rate limit",
+                        Scope::User => "rate limited",
+                    };
+                    self.stats.set_wait_status(
+                        format!(
+                            "{limit} on {label}; easing off {:.1}s",
+                            retry_after.as_secs_f64()
+                        ),
+                        retry_after,
+                    );
                     rate_retries += 1;
                     if rate_retries >= MAX_RATE_RETRIES {
                         self.stats.set_status(format!(
@@ -762,11 +705,7 @@ impl Engine {
                     return throttled;
                 }
                 DeleteOutcome::LostAccess(reason) => {
-                    self.control
-                        .blocked_channels
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(channel_id.to_string());
+                    crate::lock(&self.control.blocked_channels).insert(channel_id.to_string());
                     self.control.cloudflare_record();
                     self.stats.log_forbidden(channel_id, label, &reason);
                     let message = format!(
@@ -848,16 +787,11 @@ impl Engine {
     }
 
     fn collapse_if_needed(&self) {
-        if self.control.active_limit.load(Ordering::Relaxed) <= 1 {
+        if self.stats.active_limit.load(Ordering::Relaxed) <= 1 {
             return;
         }
-        let score = self
-            .control
-            .collapse_score
-            .fetch_add(COLLAPSE_PENALTY, Ordering::Relaxed)
-            + COLLAPSE_PENALTY;
-        if score >= COLLAPSE_THRESHOLD {
-            self.control.active_limit.store(1, Ordering::Relaxed);
+        let count = self.control.shared_limits.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= COLLAPSE_AFTER {
             self.stats.active_limit.store(1, Ordering::Relaxed);
         }
     }
@@ -879,12 +813,8 @@ impl Engine {
     }
 
     fn jitter(&self, duration: Duration) -> Duration {
-        if self.config.jitter <= 0.0 {
-            return duration;
-        }
         let factor = (rand::thread_rng().r#gen::<f64>() * 2.0 - 1.0) * self.config.jitter;
-        let ms = (duration.as_secs_f64() * (1.0 + factor)).max(0.0);
-        Duration::from_secs_f64(ms)
+        Duration::from_secs_f64((duration.as_secs_f64() * (1.0 + factor)).max(0.0))
     }
 
     async fn sleep(&self, duration: Duration) -> bool {

@@ -38,10 +38,6 @@ impl Scope {
             _ => Scope::User,
         }
     }
-
-    pub fn should_reduce_concurrency(self) -> bool {
-        matches!(self, Scope::Shared | Scope::Global)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,9 +81,7 @@ impl CurrentUser {
             discriminator: None,
         }
     }
-}
 
-impl CurrentUser {
     pub fn label(&self) -> String {
         let handle = match &self.discriminator {
             Some(d) if d != "0" && !d.is_empty() => format!("{}#{}", self.username, d),
@@ -329,10 +323,7 @@ impl DiscordClient {
         // several clients, so all clients of one token share one set of limits.
         type ByAccount = HashMap<(String, String), Arc<Mutex<Limits>>>;
         static LIMITS: OnceLock<Mutex<ByAccount>> = OnceLock::new();
-        let limits = LIMITS
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let limits = crate::lock(LIMITS.get_or_init(Mutex::default))
             .entry((base.clone(), token.clone()))
             .or_default()
             .clone();
@@ -510,10 +501,7 @@ impl DiscordClient {
         let (route, major) = route_key(request.method(), request.url().path());
         loop {
             let until = {
-                let mut limits = self
-                    .limits
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut limits = crate::lock(&self.limits);
                 let now = tokio::time::Instant::now();
                 let key = limits.gate_key(&route, &major);
                 let gate = limits.gates.get(&key).copied();
@@ -547,10 +535,7 @@ impl DiscordClient {
         let response = self.http.execute(request).await?;
         let headers = response.headers();
         let now = tokio::time::Instant::now();
-        let mut limits = self
-            .limits
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut limits = crate::lock(&self.limits);
         if let Some(bucket) = header_str(headers, "x-ratelimit-bucket") {
             limits.buckets.insert(route.clone(), bucket);
         }

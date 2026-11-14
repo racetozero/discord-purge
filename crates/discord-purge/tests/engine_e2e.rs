@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use discord_purge_core::api::DiscordClient;
-use discord_purge_core::engine::{ChannelJob, Engine, RunPhase, Stats};
+use discord_purge_core::engine::{ChannelJob, Engine, RunPhase};
 
 mod support;
 
@@ -111,14 +111,14 @@ async fn deletes_all_handling_429_404_403() {
     ];
     let total = 5;
 
-    let stats = Stats::new(total, 2);
     let cfg = discord_purge_core::engine::EngineConfig {
         workers: 2,
         delay: Duration::from_millis(1),
         jitter: 0.0,
     };
     let run = support::confirmed(&client, jobs).await;
-    let (engine, _controls) = Engine::new(cfg, client, stats.clone());
+    let (engine, controls) = Engine::new(cfg, client, total);
+    let stats = controls.stats().clone();
 
     let done: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let done2 = done.clone();

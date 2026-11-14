@@ -8,7 +8,7 @@ use axum::{
 };
 use discord_purge_core::{
     api::DiscordClient,
-    engine::{ChannelJob, Engine, EngineConfig, RunPhase, Stats},
+    engine::{ChannelJob, Engine, EngineConfig, RunPhase},
     filter::{Filter, Kind},
     search::{self, DiscoverConfig},
 };
@@ -168,9 +168,9 @@ fn config(workers: usize) -> EngineConfig {
 async fn all_channels_finish_after_concurrency_drops() {
     let (client, st, server) = server("collapse").await;
     let jobs = (1..=6).map(|n| job(n, &[1, 2])).collect();
-    let stats = Stats::new(12, 3);
     let run = support::confirmed(&client, jobs).await;
-    let (engine, _) = Engine::new(config(3), client, stats.clone());
+    let (engine, controls) = Engine::new(config(3), client, 12);
+    let stats = controls.stats().clone();
     tokio::time::timeout(Duration::from_secs(6), engine.run(run, |_| Ok(())))
         .await
         .expect("all queued channels must finish after collapse");
@@ -192,9 +192,9 @@ async fn all_channels_finish_after_concurrency_drops() {
 #[tokio::test]
 async fn invalid_token_stops_further_deletes() {
     let (client, st, server) = server("unauthorized").await;
-    let stats = Stats::new(3, 1);
     let run = support::confirmed(&client, vec![job(1, &[1, 2, 3])]).await;
-    let (engine, _) = Engine::new(config(1), client, stats.clone());
+    let (engine, controls) = Engine::new(config(1), client, 3);
+    let stats = controls.stats().clone();
     engine.run(run, |_| Ok(())).await;
     assert_eq!(st.calls.load(Ordering::SeqCst), 1);
     let phase = stats.snapshot().phase;
@@ -209,8 +209,8 @@ async fn invalid_token_stops_further_deletes() {
 #[tokio::test]
 async fn author_and_pin_checks_block_unreviewed_deletion() {
     let (client, st, server) = server("protected").await;
-    let stats = Stats::new(3, 1);
-    let (engine, _) = Engine::new(config(1), client.clone(), stats.clone());
+    let (engine, controls) = Engine::new(config(1), client.clone(), 3);
+    let stats = controls.stats().clone();
     let completed = Arc::new(Mutex::new(Vec::new()));
     let recorded = completed.clone();
     engine
@@ -244,9 +244,9 @@ async fn author_and_pin_checks_block_unreviewed_deletion() {
 #[tokio::test]
 async fn stop_interrupts_a_long_rate_limit_wait() {
     let (client, st, server) = server("stop").await;
-    let stats = Stats::new(2, 1);
     let run = support::confirmed(&client, vec![job(1, &[1, 2])]).await;
-    let (engine, controls) = Engine::new(config(1), client, stats.clone());
+    let (engine, controls) = Engine::new(config(1), client, 2);
+    let stats = controls.stats().clone();
     let task = tokio::spawn(async move {
         engine.run(run, |_| Ok(())).await;
     });
@@ -269,9 +269,9 @@ async fn stop_interrupts_a_long_rate_limit_wait() {
 #[tokio::test]
 async fn a_pause_is_visible_holds_requests_and_a_stop_can_end_it() {
     let (client, st, server) = server("normal").await;
-    let stats = Stats::new(2, 1);
     let run = support::confirmed(&client, vec![job(1, &[1, 2])]).await;
-    let (engine, controls) = Engine::new(config(1), client, stats.clone());
+    let (engine, controls) = Engine::new(config(1), client, 2);
+    let stats = controls.stats().clone();
     controls.pause();
     let task = tokio::spawn(async move {
         engine.run(run, |_| Ok(())).await;
@@ -318,9 +318,9 @@ async fn clients_of_one_token_share_discord_rate_limits() {
 #[tokio::test]
 async fn resume_write_error_stops_new_deletes() {
     let (client, st, server) = server("normal").await;
-    let stats = Stats::new(2, 1);
     let run = support::confirmed(&client, vec![job(1, &[1, 2])]).await;
-    let (engine, _) = Engine::new(config(1), client, stats.clone());
+    let (engine, controls) = Engine::new(config(1), client, 2);
+    let stats = controls.stats().clone();
     engine.run(run, |_| anyhow::bail!("disk full")).await;
     assert_eq!(st.calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
@@ -440,7 +440,7 @@ async fn package_preview_is_offline_even_with_a_token() {
     let preview = discord_purge_core::prepare(&client, &source, &Filter::default())
         .await
         .unwrap();
-    assert_eq!(preview.total, 50);
+    assert_eq!(preview.total(), 50);
     assert_eq!(preview.account_id, "unknown");
     assert_eq!(
         st.me_calls.load(Ordering::SeqCst),

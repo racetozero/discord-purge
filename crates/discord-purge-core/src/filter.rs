@@ -100,8 +100,17 @@ pub(crate) fn attachment_kind(url: &str) -> Kind {
     }
 }
 
+/// True when the text has `http://` or `https://`, in any case. A search for
+/// the rare `:` is faster than a case-insensitive scan of each byte.
 fn has_link(text: &str) -> bool {
-    contains_ignore_ascii_case(text, "http://") || contains_ignore_ascii_case(text, "https://")
+    text.match_indices(':').any(|(at, _)| {
+        let before = &text.as_bytes()[..at];
+        text[at..].starts_with("://")
+            && [b"http".as_slice(), b"https"].into_iter().any(|scheme| {
+                (before.len().checked_sub(scheme.len()))
+                    .is_some_and(|start| before[start..].eq_ignore_ascii_case(scheme))
+            })
+    })
 }
 
 /// Case-insensitive ASCII substring search without a lowercase copy.
@@ -142,8 +151,10 @@ pub struct Filter {
     pub types: Kind,
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
-    pub after_id: Option<String>,
-    pub before_id: Option<String>,
+    /// Keep only IDs from this one on.
+    pub after_id: Option<u64>,
+    /// Keep only IDs up to this one.
+    pub before_id: Option<u64>,
 }
 
 impl Filter {
@@ -218,12 +229,7 @@ impl Filter {
         Ok(ContentMatch::Contains(text.to_ascii_lowercase()))
     }
 
-    /// A non-numeric ID never passes.
-    pub fn keep(&self, id: &str, content: &str, kind: Kind) -> bool {
-        id.parse().is_ok_and(|id| self.keep_id(id, content, kind))
-    }
-
-    pub fn keep_id(&self, id: u64, content: &str, kind: Kind) -> bool {
+    pub fn keep(&self, id: u64, content: &str, kind: Kind) -> bool {
         if !self.types.is_empty() && (self.types & kind).is_empty() {
             return false;
         }
@@ -240,32 +246,14 @@ impl Filter {
                 }
             }
         }
-        if self.after.is_some() || self.before.is_some() {
-            let time = snowflake_time(id);
-            if self
-                .after
-                .is_some_and(|a| time.is_some_and(|time| time < a))
-                || self
-                    .before
-                    .is_some_and(|b| time.is_some_and(|time| time > b))
-            {
-                return false;
-            }
+        // Compare milliseconds: a `DateTime` for each message is slow.
+        let time = ((id >> 22) + DISCORD_EPOCH_MS) as i64;
+        if self.after.is_some_and(|a| time < a.timestamp_millis())
+            || self.before.is_some_and(|b| time > b.timestamp_millis())
+        {
+            return false;
         }
-        if self.after_id.is_some() || self.before_id.is_some() {
-            let id = id.to_string();
-            if let Some(a) = &self.after_id
-                && cmp_snowflake(&id, a) == std::cmp::Ordering::Less
-            {
-                return false;
-            }
-            if let Some(b) = &self.before_id
-                && cmp_snowflake(&id, b) == std::cmp::Ordering::Greater
-            {
-                return false;
-            }
-        }
-        true
+        self.after_id.is_none_or(|a| id >= a) && self.before_id.is_none_or(|b| id <= b)
     }
 }
 
@@ -327,8 +315,8 @@ mod tests {
                 .with_inputs(None, None, Some(date), None)
                 .unwrap()
         };
-        assert!(after("2016-04-01").keep_id(id, "", Kind::TEXT));
-        assert!(!after("2016-05-01").keep_id(id, "", Kind::TEXT));
+        assert!(after("2016-04-01").keep(id, "", Kind::TEXT));
+        assert!(!after("2016-05-01").keep(id, "", Kind::TEXT));
     }
 
     #[test]
@@ -340,14 +328,35 @@ mod tests {
     }
 
     #[test]
+    fn link_detection_matches_a_case_insensitive_substring_search() {
+        for text in [
+            "",
+            "://",
+            "http:/",
+            "ftp://x",
+            "see HTTPS://x",
+            "xhttp://y",
+            "ttps://",
+            "Http://",
+            "a://b http://c",
+            "✓https://",
+            "https:://",
+        ] {
+            let lower = text.to_ascii_lowercase();
+            let expected = lower.contains("http://") || lower.contains("https://");
+            assert_eq!(has_link(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
     fn regex_content_filter() {
         let c = Filter::parse_content("/^hi/i").unwrap();
         let f = Filter {
             content: c,
             ..Default::default()
         };
-        assert!(f.keep("1", "HImom", Kind::TEXT));
-        assert!(!f.keep("1", "bye", Kind::TEXT));
+        assert!(f.keep(1, "HImom", Kind::TEXT));
+        assert!(!f.keep(1, "bye", Kind::TEXT));
     }
 
     #[test]
@@ -376,7 +385,7 @@ mod tests {
             types: Kind::IMAGE,
             ..Default::default()
         };
-        assert!(f.keep("1", "", Kind::IMAGE));
-        assert!(!f.keep("1", "hello", Kind::TEXT));
+        assert!(f.keep(1, "", Kind::IMAGE));
+        assert!(!f.keep(1, "hello", Kind::TEXT));
     }
 }

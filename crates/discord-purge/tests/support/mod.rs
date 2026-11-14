@@ -9,7 +9,6 @@ pub async fn confirmed(client: &DiscordClient, jobs: Vec<ChannelJob>) -> Confirm
     PreparedRun {
         account_id: "unknown".into(),
         account_label: String::new(),
-        total: jobs.iter().map(|job| job.items.len()).sum(),
         jobs,
         complete: true,
     }

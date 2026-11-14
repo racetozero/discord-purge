@@ -13,7 +13,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use discord_purge_core::api::DiscordClient;
-use discord_purge_core::engine::{Engine, EngineConfig, Stats};
+use discord_purge_core::engine::EngineConfig;
 use discord_purge_core::filter::Filter;
 use discord_purge_core::resume::format_duration;
 use discord_purge_core::{Options, Source, prepare, resume};
@@ -336,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
     }
     println!(
         "Matched {} message(s) across {} channel(s).",
-        preview.total,
+        preview.total(),
         preview.jobs.len()
     );
     for job in preview.jobs.iter().take(50) {
@@ -353,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
         println!("\nDry run: nothing was deleted. Re-run with --execute to delete.");
         return Ok(());
     }
-    if preview.total == 0 {
+    if preview.total() == 0 {
         println!("Nothing to delete.");
         return Ok(());
     }
@@ -368,11 +368,9 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("Deleting {} message(s)…", run.total);
 
-    let account = run.account_label.clone();
-    let stats = Stats::new(run.total, settings.workers);
-    let (engine, controls) = Engine::new(settings, client, stats.clone());
-    let log = resume::ResumeLog::open(&run.account_id)?;
-
+    let handle = run.start(settings, client, cli.report.clone())?;
+    let stats = handle.controls.stats().clone();
+    let controls = handle.controls;
     let signal = tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => controls.stop(),
@@ -408,13 +406,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    engine.run(run, move |key| log.record(key)).await;
+    // The task writes the report before it ends, so a closed pipe that stops
+    // the printing below cannot lose the report.
+    let report = handle.task.await??;
     printer.abort();
     signal.abort();
 
     let snap = stats.snapshot();
-    // Write the report first: printing can panic on a closed pipe.
-    let report = resume::write_report(&account, &snap, cli.report.as_deref())?;
     eprintln!();
     println!(
         "{}. deleted {} | skipped {} | deferred {} | failed {} in {}.",

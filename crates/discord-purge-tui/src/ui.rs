@@ -1,6 +1,7 @@
 //! Drawing for the terminal workspace, the run, and the modals.
+use discord_purge_core::RunHandle;
 use discord_purge_core::engine::Snapshot;
-use discord_purge_core::filter::{ContentMatch, snowflake_time as snowflake_created};
+use discord_purge_core::filter::{TYPE_NAMES, snowflake_time as snowflake_created};
 use discord_purge_core::resume::format_duration;
 use ratatui::prelude::*;
 use ratatui::widgets::{
@@ -8,8 +9,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, FilterField, Focus, HistoryLoad, Modal, Range, Row, Screen, SourceField, TYPES,
-    message_ref,
+    App, FilterField, Focus, HistoryLoad, Modal, Range, Row, Screen, SourceField, message_ref,
 };
 
 /// Highlighter amber marks what is selected; red is only for deletion.
@@ -24,7 +24,7 @@ pub(crate) const MIN_HEIGHT: u16 = 18;
 fn clean(value: &str) -> String {
     value
         .chars()
-        .map(|channel| if channel.is_control() { ' ' } else { channel })
+        .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
 
@@ -97,7 +97,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(area);
     draw_header(frame, header, app);
-    match app.screen {
+    match &app.screen {
         Screen::Workspace => {
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -110,13 +110,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
                 draw_modal(frame, area, app, modal);
             }
         }
-        Screen::Running | Screen::Done => {
+        Screen::Running(RunHandle { controls, .. }) | Screen::Done { controls, .. } => {
             let [run] = Layout::vertical([Constraint::Min(5)]).areas(body.union(plan));
-            if let Some(stats) = &app.stats {
-                draw_run(frame, run, app, &stats.snapshot());
-            }
+            draw_run(frame, run, app, &controls.stats().snapshot());
             frame.render_widget(
-                if app.screen == Screen::Running {
+                if matches!(app.screen, Screen::Running(_)) {
                     hints(&[("Space", "pause/continue"), ("s", "stop")])
                 } else {
                     hints(&[("Enter", "new selection"), ("q", "quit")])
@@ -456,12 +454,10 @@ fn range_text(app: &App) -> String {
 }
 
 fn filter_text(app: &App) -> String {
-    let frame = &app.config.filter;
-    let inputs = frame.inputs();
+    let inputs = app.config.filter.inputs();
     let mut parts = Vec::new();
-    match &frame.content {
-        ContentMatch::Any => {}
-        _ => parts.push(format!("text {:?}", inputs.content)),
+    if !inputs.content.is_empty() {
+        parts.push(format!("text {:?}", inputs.content));
     }
     if !inputs.types.is_empty() {
         parts.push(inputs.types.replace(',', "+"));
@@ -497,7 +493,7 @@ fn draw_plan(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 format!(
                     "Preview: {} in {}. ",
-                    plural(run.total, "message", "messages"),
+                    plural(run.total(), "message", "messages"),
                     plural(run.jobs.len(), "channel", "channels")
                 ),
                 Style::default().fg(MARK).add_modifier(Modifier::BOLD),
@@ -628,8 +624,8 @@ fn draw_run(frame: &mut Frame, area: Rect, app: &App, snapshot: &Snapshot) {
     .collect();
     frame.render_widget(Line::from(spans), numbers);
     let mut text = clean(snapshot.phase.reason().unwrap_or(&snapshot.status));
-    if app.screen == Screen::Done {
-        text = format!("{text}  Report: {}", app.report);
+    if let Screen::Done { report, .. } = &app.screen {
+        text = format!("{text}  Report: {report}");
     }
     frame.render_widget(
         Paragraph::new(text)
@@ -749,7 +745,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     Line::styled(
                         format!(
                             "Delete {} from {}?",
-                            plural(run.map_or(0, |r| r.total), "message", "messages"),
+                            plural(run.map_or(0, |r| r.total()), "message", "messages"),
                             if app.package.is_some() {
                                 "the account of your token".to_string()
                             } else {
@@ -779,7 +775,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
             if let Some(run) = app.preview_ready() {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        plural(run.total, "message", "messages"),
+                        plural(run.total(), "message", "messages"),
                         Style::default().fg(MARK).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(
@@ -886,7 +882,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
             (" Source ".into(), 80, lines, false)
         }
         Modal::Filters(form) => {
-            let chips: Vec<Span> = TYPES
+            let chips: Vec<Span> = TYPE_NAMES
                 .iter()
                 .enumerate()
                 .map(|(index, t)| {
@@ -1029,8 +1025,8 @@ mod tests {
     use super::*;
     use crate::app::{History, Screen};
     use discord_purge_core::Options;
-    use discord_purge_core::api::Channel;
-    use discord_purge_core::engine::{ForbiddenStat, RunPhase, Stats};
+    use discord_purge_core::api::{Channel, DiscordClient};
+    use discord_purge_core::engine::{Engine, ForbiddenStat, RunPhase, Stats};
     use discord_purge_core::filter::Filter;
 
     fn render(app: &App, width: u16, height: u16) -> String {
@@ -1045,6 +1041,15 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A run screen with controls that send nothing to Discord.
+    fn running(total: usize) -> Screen {
+        let client = DiscordClient::with_base("token", "http://127.0.0.1:9").unwrap();
+        Screen::Running(RunHandle {
+            controls: Engine::new(Default::default(), client, total).1,
+            task: tokio::spawn(std::future::pending()),
+        })
     }
 
     fn empty() -> App {
@@ -1072,14 +1077,13 @@ mod tests {
         assert!(render(&app, 59, 30).contains("Enlarge the terminal"));
     }
 
-    #[test]
-    fn running_screen_shows_progress_and_channel_skip_reason() {
+    #[tokio::test]
+    async fn running_screen_shows_progress_and_channel_skip_reason() {
         let mut app = empty();
-        app.screen = Screen::Running;
-        app.stats = Some(Stats::new(31, 1));
+        app.screen = running(31);
         let screen = render(&app, 100, 30);
         assert!(screen.contains("Deleting") && screen.contains("0 of 31"));
-        let mut snapshot = app.stats.as_ref().unwrap().snapshot();
+        let mut snapshot = Stats::new(31, 1).snapshot();
         snapshot.forbidden.push(ForbiddenStat {
             count: 1,
             reason: "Only bots can use this endpoint".into(),
@@ -1094,7 +1098,7 @@ mod tests {
             .buffer()
             .content
             .iter()
-            .map(|channel| channel.symbol())
+            .map(|cell| cell.symbol())
             .collect();
         assert!(
             rendered.contains("Only bots can use this endpoint"),
@@ -1104,11 +1108,8 @@ mod tests {
 
     #[test]
     fn running_screen_shows_a_pause_and_an_abort_reason() {
-        let mut app = empty();
-        app.screen = Screen::Running;
-        let stats = Stats::new(1, 1);
-        app.stats = Some(stats.clone());
-        let mut snapshot = stats.snapshot();
+        let app = empty();
+        let mut snapshot = Stats::new(1, 1).snapshot();
         snapshot.phase = RunPhase::Paused;
         let rendered = |snapshot: &Snapshot| {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
@@ -1131,10 +1132,8 @@ mod tests {
 
     #[test]
     fn running_screen_shows_a_reduced_request_limit() {
-        let mut app = empty();
-        app.screen = Screen::Running;
-        app.stats = Some(Stats::new(1, 4));
-        let mut snapshot = app.stats.as_ref().unwrap().snapshot();
+        let app = empty();
+        let mut snapshot = Stats::new(1, 4).snapshot();
         snapshot.active_limit = 1;
         // Wide enough that the notice does not wrap inside the checked words.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();

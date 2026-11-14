@@ -423,11 +423,12 @@ function rangeBody() {
   return { kind: 'all' };
 }
 const own = (m) => S.account && m.author.id === S.account.id && !NON_DELETABLE.includes(m.type || 0) && (!m.pinned || $('include_pinned').checked);
-function inRange(m) {
-  if (!S.history || !own(m) || !inScope(S.history.channel)) return false;
+// One render passes the scope test and the anchor ID, which are the same for each message.
+function inRange(m, scoped, anchor) {
+  if (!scoped || !own(m)) return false;
   const r = S.range, id = BigInt(m.id);
-  if (r.kind === 'older') return id < BigInt(r.anchor.message_id);
-  if (r.kind === 'newer') return id > BigInt(r.anchor.message_id);
+  if (r.kind === 'older') return id < anchor;
+  if (r.kind === 'newer') return id > anchor;
   if (r.kind === 'only') return r.picked.has(`${m.channel_id}:${m.id}`);
   return true;
 }
@@ -549,8 +550,9 @@ function renderMessages() {
   }
   const anchorKey = r.anchor ? `${r.anchor.channel_id}:${r.anchor.message_id}` : null;
   const list = h('ol', { class: 'msgs' });
+  const scoped = inScope(history.channel), anchor = r.anchor ? BigInt(r.anchor.message_id) : null;
   for (const m of history.messages) {
-    const key = `${m.channel_id}:${m.id}`, ref = { channel_id: m.channel_id, message_id: m.id }, mine = own(m), doomed = inRange(m);
+    const key = `${m.channel_id}:${m.id}`, ref = { channel_id: m.channel_id, message_id: m.id }, mine = own(m), doomed = inRange(m, scoped, anchor);
     const box = mine ? h('input', { type: 'checkbox', 'aria-label': 'Mark this message', onchange: () => setRange('only', ref, history.channel) }) : h('span');
     if (mine) box.checked = r.kind === 'only' && r.picked.has(key);
     let text = m.content || (m.attachments?.length ? `[${m.attachments.map((a) => a.filename).join(', ')}]` : '[no text]');

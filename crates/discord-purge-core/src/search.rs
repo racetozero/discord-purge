@@ -110,7 +110,7 @@ pub async fn discover(
     }
 
     let mut by_channel: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    let mut cursor: Option<String> = filter.before_id.clone(); // exclusive upper boundary
+    let mut cursor: Option<String> = filter.before_id.map(|id| id.to_string()); // exclusive upper boundary
     let mut offset = 0usize;
     let mut oldest: Option<String> = None;
     let mut empty_pages = 0u32;
@@ -122,7 +122,7 @@ pub async fn discover(
             guild_id: config.guild_id.clone(),
             channel_ids: config.channel_ids.clone(),
             author_id: config.author_id.clone(),
-            min_id: filter.after_id.clone(),
+            min_id: filter.after_id.map(|id| id.to_string()),
             max_id: cursor.clone(),
             offset,
         };
@@ -173,18 +173,15 @@ pub async fn discover(
                 &message.content,
                 message.attachments.iter().map(|a| a.filename.as_str()),
             );
-            if !filter.keep(&message.id, &message.content, kind) {
+            let Some(id) =
+                (message.id.parse().ok()).filter(|&id| filter.keep(id, &message.content, kind))
+            else {
                 continue;
-            }
+            };
             by_channel
                 .entry(message.channel_id.clone())
                 .or_default()
-                .push(message.id.parse().map_err(|_| {
-                    anyhow::anyhow!(
-                        "Discord returned an invalid message ID {:?}. Retry later or use a data package.",
-                        message.id
-                    )
-                })?);
+                .push(id);
         }
 
         offset += PAGE_SIZE;

@@ -8,7 +8,7 @@ use axum::{
 };
 use discord_purge_core::{
     api::DiscordClient,
-    engine::{ChannelJob, Engine, EngineConfig, RunPhase, Stats},
+    engine::{ChannelJob, Engine, EngineConfig, RunPhase},
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -115,8 +115,8 @@ fn config() -> EngineConfig {
 #[tokio::test]
 async fn user_account_deletes_after_exact_history_verification() {
     let (client, st, server) = server("normal").await;
-    let stats = Stats::new(2, 1);
-    let (engine, _) = Engine::new(config(), client.clone(), stats.clone());
+    let (engine, controls) = Engine::new(config(), client.clone(), 2);
+    let stats = controls.stats().clone();
     let done = Arc::new(Mutex::new(Vec::new()));
     let completed = done.clone();
     engine
@@ -146,9 +146,9 @@ async fn user_account_deletes_after_exact_history_verification() {
 async fn unverified_foreign_and_pinned_history_never_authorizes_delete() {
     for mode in ["neighbor", "empty", "foreign", "pinned", "missing-pin"] {
         let (client, st, server) = server(mode).await;
-        let stats = Stats::new(1, 1);
         let run = support::confirmed(&client, vec![job(1)]).await;
-        let (engine, _) = Engine::new(config(), client, stats.clone());
+        let (engine, controls) = Engine::new(config(), client, 1);
+        let stats = controls.stats().clone();
         let done = Arc::new(Mutex::new(Vec::new()));
         let completed = done.clone();
         engine
@@ -176,11 +176,10 @@ async fn unverified_foreign_and_pinned_history_never_authorizes_delete() {
 #[tokio::test]
 async fn verified_jobs_delete_without_a_history_check() {
     let (client, st, server) = server("foreign").await;
-    let stats = Stats::new(2, 1);
     let mut verified = job(2);
     verified.verified = true;
     let run = support::confirmed(&client, vec![verified]).await;
-    let (engine, _) = Engine::new(config(), client, stats.clone());
+    let (engine, _) = Engine::new(config(), client, 2);
     engine.run(run, |_| Ok(())).await;
     assert_eq!(*st.deleted.lock().unwrap(), vec!["20", "21"]);
     assert!(st.calls.lock().unwrap().is_empty());
@@ -191,11 +190,11 @@ async fn verified_jobs_delete_without_a_history_check() {
 async fn endpoint_error_aborts_and_access_error_defers_without_per_item_waits() {
     for mode in ["endpoint", "access"] {
         let (client, st, server) = server(mode).await;
-        let stats = Stats::new(31, 1);
         let mut cfg = config();
         cfg.delay = Duration::from_secs(120);
         let run = support::confirmed(&client, vec![job(31)]).await;
-        let (engine, _) = Engine::new(cfg, client, stats.clone());
+        let (engine, controls) = Engine::new(cfg, client, 31);
+        let stats = controls.stats().clone();
         let done = Arc::new(Mutex::new(Vec::new()));
         let completed = done.clone();
         tokio::time::timeout(

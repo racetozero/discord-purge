@@ -23,7 +23,6 @@ async fn package_selection_has_strict_bounds_and_exact_cross_channel_sets() {
     assert_eq!(catalog.dms[0].id, "222");
     let all = discord_purge_core::package::load(&path, &Filter::default()).unwrap();
     let expected: HashSet<_> = all
-        .channels
         .iter()
         .flat_map(|c| c.messages.iter().map(move |m| (c.id.clone(), m.id.clone())))
         .collect();
@@ -94,7 +93,7 @@ async fn package_selection_has_strict_bounds_and_exact_cross_channel_sets() {
             .cloned()
             .collect();
         assert_eq!(actual, expected);
-        assert_eq!(run.total, actual.len());
+        assert_eq!(run.total(), actual.len());
     }
     let dm = selection::messages(&client, Some(&path), "222", None)
         .await
@@ -122,7 +121,7 @@ async fn package_selection_has_strict_bounds_and_exact_cross_channel_sets() {
     )
     .await
     .unwrap();
-    assert_eq!(run.total, 2);
+    assert_eq!(run.total(), 2);
     assert_eq!(run.jobs.len(), 2);
     let invalid = Selection {
         targets: vec![Target::Dm {
@@ -278,7 +277,7 @@ async fn live_catalog_history_and_selection_obey_the_requested_scope() {
     )
     .await
     .unwrap();
-    assert_eq!(run.total, 1);
+    assert_eq!(run.total(), 1);
     assert_eq!(run.jobs[0].items[0], 30);
     assert_eq!(
         seen.lock()

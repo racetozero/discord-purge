@@ -22,6 +22,8 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 csv = "1"
 dirs = "5"
+# The zlib-rs backend inflates package ZIP files faster than miniz_oxide.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 discord-purge-core = { path = "crates/discord-purge-core", version = "0.0.2" }
 discord-purge-tui = { path = "crates/discord-purge-tui", version = "0.0.2" }
 discord-purge-web = { path = "crates/discord-purge-web", version = "0.0.2" }
@@ -37,7 +39,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.44", features = ["full"] }
-zip = "2"
+# Discord data packages use deflate only.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.dist]
 inherits = "release"

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{BrowseMessage, Channel, CurrentUser, DiscordClient, Guild, is_deletable_type};
 use crate::engine::ChannelJob;
 use crate::filter::{Filter, classify, cmp_snowflake};
-use crate::package::{LoadedPackage, PkgMessage};
+use crate::package::{PkgMessage, RawChannel};
 use crate::search::{DiscoverConfig, Discovered, MAX_CHANNELS, Target};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -33,6 +33,17 @@ pub enum MessageRange {
     Only {
         messages: Vec<MessageRef>,
     },
+}
+
+impl MessageRange {
+    /// The messages that this range names.
+    pub fn refs(&self) -> &[MessageRef] {
+        match self {
+            Self::All => &[],
+            Self::Older { anchor } | Self::Newer { anchor } => std::slice::from_ref(anchor),
+            Self::Only { messages } => messages,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,20 +97,13 @@ impl Selection {
                 Target::Dm { channel_id } => validate_id(channel_id)?,
             }
         }
-        let refs = match &self.range {
-            MessageRange::All => &[][..],
-            MessageRange::Older { anchor } | MessageRange::Newer { anchor } => {
-                std::slice::from_ref(anchor)
-            }
-            MessageRange::Only { messages } => {
-                ensure!(
-                    !messages.is_empty() && messages.len() <= 10000,
-                    "You selected no messages or too many messages. Select 1 to 10000 messages, or use All messages."
-                );
-                messages.as_slice()
-            }
-        };
-        for message in refs {
+        if let MessageRange::Only { messages } = &self.range {
+            ensure!(
+                !messages.is_empty() && messages.len() <= 10000,
+                "You selected no messages or too many messages. Select 1 to 10000 messages, or use All messages."
+            );
+        }
+        for message in self.range.refs() {
             validate_id(&message.channel_id)?;
             validate_id(&message.message_id)?;
         }
@@ -145,7 +149,7 @@ type PackageStamp = (PathBuf, u64, Option<SystemTime>);
 /// Browsing asks for the same package for each list and page, so keep the
 /// last result of each kind.
 type Cache<K, T> = Mutex<Option<(K, T)>>;
-static PACKAGE_IDS: Cache<PackageStamp, Arc<LoadedPackage<u64>>> = Mutex::new(None);
+static PACKAGE_IDS: Cache<PackageStamp, Arc<Vec<RawChannel<u64>>>> = Mutex::new(None);
 static PACKAGE_HISTORY: Cache<(PackageStamp, String), Arc<Vec<PkgMessage>>> = Mutex::new(None);
 
 fn package_stamp(path: &Path) -> anyhow::Result<PackageStamp> {
@@ -163,9 +167,7 @@ fn cached<K: PartialEq, T: Clone>(
     key: K,
     load: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let mut slot = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut slot = crate::lock(slot);
     if let Some((cached_key, value)) = slot.as_ref()
         && *cached_key == key
     {
@@ -176,7 +178,7 @@ fn cached<K: PartialEq, T: Clone>(
     Ok(value)
 }
 
-fn package_ids(path: &Path) -> anyhow::Result<Arc<LoadedPackage<u64>>> {
+fn package_ids(path: &Path) -> anyhow::Result<Arc<Vec<RawChannel<u64>>>> {
     cached(&PACKAGE_IDS, package_stamp(path)?, || {
         Ok(Arc::new(crate::package::load_ids(
             path,
@@ -204,7 +206,7 @@ pub async fn catalog(client: &DiscordClient, package: Option<&Path>) -> anyhow::
         let package = package_ids(path)?;
         let mut guilds = BTreeMap::new();
         let mut dms = Vec::new();
-        for channel in &package.channels {
+        for channel in package.iter() {
             if channel.is_dm {
                 dms.push(package_channel(channel));
             } else if !channel.guild_id.is_empty() {
@@ -242,7 +244,6 @@ pub async fn channels(
     }
     if let Some(path) = package {
         return Ok(package_ids(path)?
-            .channels
             .iter()
             .filter(|c| guild_ids.iter().any(|id| id == &c.guild_id))
             .map(package_channel)
@@ -273,20 +274,16 @@ pub async fn messages(
     if let Some(path) = package {
         let key = (package_stamp(path)?, channel_id.to_string());
         let history = cached(&PACKAGE_HISTORY, key, || {
-            let channel = crate::package::load_channel(path, channel_id)?
-                .channels
-                .into_iter()
-                .next()
-                .context(
-                    "The channel is not in this package. Select a listed channel and retry.",
-                )?;
-            let mut messages = channel.messages;
+            let mut messages = crate::package::load_channel(path, channel_id)?.messages;
             messages.sort_by(|a, b| cmp_snowflake(&b.id, &a.id));
             Ok(Arc::new(messages))
         })?;
-        return Ok(history
+        // The history is newest first, so the older messages are its tail.
+        let start = before.map_or(0, |id| {
+            history.partition_point(|m| !cmp_snowflake(&m.id, id).is_lt())
+        });
+        return Ok(history[start..]
             .iter()
-            .filter(|m| before.is_none_or(|id| cmp_snowflake(&m.id, id).is_lt()))
             .take(crate::api::HISTORY_PAGE)
             .map(|m| BrowseMessage {
                 id: m.id.clone(),
@@ -311,13 +308,7 @@ pub async fn discover(
     filter: &Filter,
 ) -> anyhow::Result<Discovered> {
     selection.validate()?;
-    let refs: &[MessageRef] = match &selection.range {
-        MessageRange::Older { anchor } | MessageRange::Newer { anchor } => {
-            std::slice::from_ref(anchor)
-        }
-        MessageRange::Only { messages } => messages,
-        MessageRange::All => &[],
-    };
+    let refs = selection.range.refs();
     // `validate` checked every ID, so these parse.
     let required: HashSet<(&str, u64)> = refs
         .iter()
@@ -335,13 +326,14 @@ pub async fn discover(
         MessageRange::Only { .. } => required.contains(&(channel, id)),
     };
     if let Some(path) = package {
-        let package = crate::package::scan(path, &Filter::default(), |id, content, kind| {
-            (id, filter.keep_id(id, content, kind))
-        })?;
+        let package = crate::package::scan(
+            path,
+            &Filter::default(),
+            |c| selection.contains_channel(&package_channel(c)),
+            |id, content, kind| (id, filter.keep(id, content, kind)),
+        )?;
         let found: HashSet<(&str, u64)> = package
-            .channels
             .iter()
-            .filter(|c| selection.contains_channel(&package_channel(c)))
             .flat_map(|c| c.messages.iter().map(move |&(id, _)| (c.id.as_str(), id)))
             .filter(|key| required.contains(key))
             .collect();
@@ -350,9 +342,7 @@ pub async fn discover(
             "A selected message is outside the selected package channels. Choose the message from the current scope and retry."
         );
         let jobs = package
-            .channels
             .into_iter()
-            .filter(|c| selection.contains_channel(&package_channel(c)))
             .filter_map(|c| {
                 let label = c.label();
                 let id = c.id;
@@ -397,22 +387,16 @@ pub async fn discover(
                 .message(&reference.channel_id, &reference.message_id)
                 .await?;
             ensure!(
-                message.id == reference.message_id && message.channel_id == reference.channel_id,
-                "Discord returned a different message. Refresh the message list and preview again."
-            );
-            ensure!(
                 message.author.id == account,
                 "You selected another account's message. Select only your own messages and retry."
             );
             if !is_deletable_type(message.kind, message.pinned, selection.include_pinned) {
                 continue;
             }
+            // `validate` checked the ID, so it parses.
+            let id = parse_id(&reference.message_id).unwrap_or_default();
             let names = message.attachments.iter().map(|a| a.filename.as_str());
-            if !filter.keep(
-                &message.id,
-                &message.content,
-                classify(&message.content, names),
-            ) {
+            if !filter.keep(id, &message.content, classify(&message.content, names)) {
                 continue;
             }
             let channel = channel_cache.get(&reference.channel_id).with_context(|| {
@@ -430,12 +414,7 @@ pub async fn discover(
                     verified: true,
                 })
                 .items
-                .push(reference.message_id.parse().map_err(|_| {
-                    anyhow::anyhow!(
-                        "The selected message ID {:?} is not numeric. Choose the message from the list and retry.",
-                        reference.message_id
-                    )
-                })?);
+                .push(id);
         }
         return Ok(Discovered {
             jobs: jobs.into_values().collect(),
@@ -448,22 +427,15 @@ pub async fn discover(
             .await?;
     }
     let mut filter = filter.clone();
+    // `validate` checked the anchor ID, so it parses.
     match &selection.range {
-        MessageRange::Older { anchor }
-            if filter
-                .before_id
-                .as_ref()
-                .is_none_or(|id| cmp_snowflake(&anchor.message_id, id).is_lt()) =>
-        {
-            filter.before_id = Some(anchor.message_id.clone())
+        MessageRange::Older { anchor } => {
+            let id = parse_id(&anchor.message_id).unwrap_or_default();
+            filter.before_id = Some(filter.before_id.map_or(id, |before| before.min(id)));
         }
-        MessageRange::Newer { anchor }
-            if filter
-                .after_id
-                .as_ref()
-                .is_none_or(|id| cmp_snowflake(&anchor.message_id, id).is_gt()) =>
-        {
-            filter.after_id = Some(anchor.message_id.clone())
+        MessageRange::Newer { anchor } => {
+            let id = parse_id(&anchor.message_id).unwrap_or_default();
+            filter.after_id = Some(filter.after_id.map_or(id, |after| after.max(id)));
         }
         _ => {}
     }

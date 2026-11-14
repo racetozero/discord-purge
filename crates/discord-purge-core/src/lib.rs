@@ -19,8 +19,17 @@ pub mod search;
 pub mod selection;
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
-use engine::{ChannelJob, EngineConfig};
+use engine::{ChannelJob, Controls, Engine, EngineConfig};
+
+/// Lock a mutex. A panic in another holder does not stop the run, because each
+/// guarded value stays valid between its updates.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How to find your Discord user token. Shown by `discord-purge login` and in
 /// the TUI token screen, so both front ends tell the same story.
@@ -99,7 +108,6 @@ pub struct PreparedRun {
     pub account_id: String,
     pub account_label: String,
     pub jobs: Vec<ChannelJob>,
-    pub total: usize,
     /// False when a search stopped before it reached the end of its results.
     /// `search::INCOMPLETE_NOTICE` tells the user what this means.
     pub complete: bool,
@@ -116,7 +124,42 @@ pub struct ConfirmedRun {
     pub(crate) jobs: Vec<ChannelJob>,
 }
 
+/// A run that deletes in the background. `task` ends after the report is
+/// written, and gives the report path.
+pub struct RunHandle {
+    pub controls: Controls,
+    pub task: tokio::task::JoinHandle<anyhow::Result<PathBuf>>,
+}
+
+impl ConfirmedRun {
+    /// Start deleting. Each finished message goes to the account's resume log,
+    /// so a later run skips it. The report goes to `report`, or to the state
+    /// directory. Fails only when the resume log cannot be opened, before any
+    /// request is sent.
+    pub fn start(
+        self,
+        settings: EngineConfig,
+        client: api::DiscordClient,
+        report: Option<PathBuf>,
+    ) -> anyhow::Result<RunHandle> {
+        let log = resume::ResumeLog::open(&self.account_id)?;
+        let (engine, controls) = Engine::new(settings, client, self.total);
+        let stats = controls.stats().clone();
+        let account = self.account_label.clone();
+        let task = tokio::spawn(async move {
+            engine.run(self, move |key| log.record(key)).await;
+            resume::write_report(&account, &stats.snapshot(), report.as_deref())
+        });
+        Ok(RunHandle { controls, task })
+    }
+}
+
 impl PreparedRun {
+    /// The messages that the preview matched.
+    pub fn total(&self) -> usize {
+        self.jobs.iter().map(|job| job.items.len()).sum()
+    }
+
     pub async fn confirm(&self, client: &api::DiscordClient) -> anyhow::Result<ConfirmedRun> {
         let me = client.current_user().await?;
         anyhow::ensure!(
@@ -167,7 +210,6 @@ pub async fn prepare(
     let search::Discovered { jobs, complete } = match source {
         Source::Package(path) => search::Discovered {
             jobs: package::load_ids(path, filter)?
-                .channels
                 .into_iter()
                 .map(|c| ChannelJob {
                     label: c.label(),
@@ -190,12 +232,10 @@ pub async fn prepare(
         }
     };
 
-    let total = jobs.iter().map(|j| j.items.len()).sum();
     Ok(PreparedRun {
         account_id: me.id.clone(),
         account_label: me.label(),
         jobs,
-        total,
         complete,
     })
 }

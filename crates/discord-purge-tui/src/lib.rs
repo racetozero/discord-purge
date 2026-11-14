@@ -25,8 +25,8 @@ pub async fn run(config: Options) -> anyhow::Result<()> {
     app.start();
     let result = event_loop(&mut terminal, &mut app).await;
     app.cancel_tasks();
-    if let Some(controls) = &app.controls {
-        controls.stop();
+    if let Screen::Running(run) = &app.screen {
+        run.controls.stop();
     }
     let paste_mode = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
@@ -56,8 +56,8 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> a
                     let interrupt = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                     if interrupt || (small && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))) {
                         // Stop a run first; quit otherwise.
-                        match (&app.controls, app.screen) {
-                            (Some(controls), Screen::Running) => controls.stop(),
+                        match &app.screen {
+                            Screen::Running(run) => run.controls.stop(),
                             _ => app.should_quit = true,
                         }
                     } else if !small {

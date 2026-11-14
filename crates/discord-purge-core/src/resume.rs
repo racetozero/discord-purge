@@ -16,8 +16,8 @@ use crate::engine::Snapshot;
 use anyhow::Context;
 
 pub fn state_dir() -> PathBuf {
-    if let Ok(duration) = std::env::var("DISCORD_PURGE_STATE_DIR") {
-        return PathBuf::from(duration);
+    if let Ok(directory) = std::env::var("DISCORD_PURGE_STATE_DIR") {
+        return PathBuf::from(directory);
     }
     let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("discord-purge")
@@ -153,24 +153,27 @@ pub struct ResumeLog {
 
 impl ResumeLog {
     pub fn open(account_id: &str) -> anyhow::Result<Self> {
-        let directory = state_dir();
-        std::fs::create_dir_all(&directory).map_err(|error| {
-            anyhow::anyhow!("could not create the state dir {:?}: {error}", directory)
-        })?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path(account_id))?;
+        let path = log_path(account_id);
+        let file = std::fs::create_dir_all(state_dir())
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+            })
+            .with_context(|| {
+                format!(
+                    "Cannot open the resume log {}. Make the state directory writable, or set DISCORD_PURGE_STATE_DIR to a writable folder, and retry.",
+                    path.display()
+                )
+            })?;
         Ok(Self {
             file: Mutex::new(file),
         })
     }
 
     pub fn record(&self, key: &str) -> anyhow::Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut file = crate::lock(&self.file);
         writeln!(file, "{key}")?;
         file.sync_data()?;
         Ok(())
@@ -191,29 +194,31 @@ pub fn write_report(
             directory.join(format!("report-{stamp}.txt"))
         }
     };
+    use std::fmt::Write;
     let mut body = String::new();
-    body.push_str(&format!("discord-purge report\nAccount: {account_label}\n"));
-    body.push_str(&format!(
-        "Status: {}\n",
+    writeln!(
+        body,
+        "discord-purge report\nAccount: {account_label}\nStatus: {}",
         snapshot.phase.label().to_lowercase()
-    ));
+    )?;
     if let Some(reason) = snapshot.phase.reason() {
-        body.push_str(&format!("Reason: {reason}\n"));
+        writeln!(body, "Reason: {reason}")?;
     }
-    body.push_str(&format!(
-        "Elapsed: {}\nTotal: {}  Deleted: {}  Skipped: {}  Deferred: {}  Failed: {}\n",
+    writeln!(
+        body,
+        "Elapsed: {}\nTotal: {}  Deleted: {}  Skipped: {}  Deferred: {}  Failed: {}",
         format_duration(snapshot.elapsed),
         snapshot.total,
         snapshot.deleted,
         snapshot.skipped,
         snapshot.deferred,
         snapshot.failed
-    ));
+    )?;
     if !snapshot.status.is_empty() {
-        body.push_str(&format!("Last status: {}\n", snapshot.status));
+        writeln!(body, "Last status: {}", snapshot.status)?;
     }
     if let Some(notice) = snapshot.limit_notice() {
-        body.push_str(&format!("Rate limits: {notice}\n"));
+        writeln!(body, "Rate limits: {notice}")?;
     }
     if !snapshot.forbidden.is_empty() {
         body.push_str("\nChannel/system responses, grouped by channel (response counts):\n");
@@ -221,20 +226,21 @@ pub fn write_report(
         rows.sort_by_key(|row| std::cmp::Reverse(row.count));
         for row in rows {
             let label = if row.label.is_empty() {
-                "unknown".into()
+                "unknown"
             } else {
-                row.label.clone()
+                &row.label
             };
-            body.push_str(&format!(
-                "  {:<32} {:>6}  reason: {}\n",
-                label, row.count, row.reason
-            ));
+            writeln!(
+                body,
+                "  {label:<32} {:>6}  reason: {}",
+                row.count, row.reason
+            )?;
         }
     }
     if !snapshot.errors.is_empty() {
         body.push_str("\nLast errors:\n");
         for error in snapshot.errors.iter().rev().take(20) {
-            body.push_str(&format!("  {error}\n"));
+            writeln!(body, "  {error}")?;
         }
     }
     std::fs::write(&path, body)?;

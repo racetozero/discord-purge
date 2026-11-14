@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- A large `messages.json` file no longer fails with "the message array is
+  incomplete" when a read of the file ends just after a comma.
+
+### Changed
+
+- Package previews use about 25% less CPU time. A preview of selected channels
+  reads only the message files of those channels.
+- The ZIP reader now supports only the deflate and stored methods that Discord
+  data packages use. This removes 35 crates from the build, including the bzip2
+  and xz C libraries.
+
 ## 0.0.2 - 2026-11-06
 
 ### Added

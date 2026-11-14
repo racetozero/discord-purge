@@ -6,20 +6,17 @@
 //! confirmed preview is deleted.
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crossterm::event::KeyCode;
 use discord_purge_core::api::{
     BrowseMessage, Channel, DiscordClient, TokenRejected, is_deletable_type,
 };
-use discord_purge_core::engine::{Controls, Engine, EngineConfig, Stats};
-use discord_purge_core::filter::Filter;
+use discord_purge_core::engine::{Controls, EngineConfig};
+use discord_purge_core::filter::{Filter, TYPE_NAMES, type_mask};
 use discord_purge_core::search::Target;
 use discord_purge_core::selection::{self, Catalog, MessageRange, MessageRef, Selection, parse_id};
-use discord_purge_core::{ConfirmedRun, Options, PreparedRun, Source, prepare, resume};
+use discord_purge_core::{ConfirmedRun, Options, PreparedRun, RunHandle, Source, prepare};
 use tokio::task::{JoinHandle, JoinSet};
-
-pub(crate) const TYPES: [&str; 7] = discord_purge_core::filter::TYPE_NAMES;
 
 const JOB_BUSY: &str = "A preview or start check is running. Wait, or press Esc to cancel it.";
 
@@ -54,11 +51,11 @@ pub(crate) enum Focus {
     Messages,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The workspace, or a run and its controls. Only a finished run has a report.
 pub(crate) enum Screen {
     Workspace,
-    Running,
-    Done,
+    Running(RunHandle),
+    Done { controls: Controls, report: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,9 +341,6 @@ pub(crate) struct App {
     pub activity: String,
     loads: JoinSet<Loaded>,
     job: Option<JoinHandle<Loaded>>,
-    pub stats: Option<Arc<Stats>>,
-    pub controls: Option<Controls>,
-    pub report: String,
     pub should_quit: bool,
     pub frame: usize,
 }
@@ -357,7 +351,7 @@ impl App {
         let token = config
             .token
             .clone()
-            .filter(|server| !server.trim().is_empty())
+            .filter(|token| !token.trim().is_empty())
             .or_else(|| config.token_store.load());
         let package = config.package.clone();
         Self {
@@ -386,9 +380,6 @@ impl App {
             activity: String::new(),
             loads: JoinSet::new(),
             job: None,
-            stats: None,
-            controls: None,
-            report: String::new(),
             should_quit: false,
             frame: 0,
         }
@@ -450,12 +441,11 @@ impl App {
 
     fn open_filters(&mut self) {
         let inputs = self.config.filter.inputs();
-        let chosen: Vec<&str> = inputs.types.split(',').collect();
         let settings = &self.config.settings;
         self.modal = Some(Modal::Filters(FilterForm {
             field: FilterField::Content,
             content: inputs.content,
-            types: TYPES.map(|t| chosen.contains(&t)),
+            types: TYPE_NAMES.map(|name| self.config.filter.types.contains(type_mask(name))),
             type_cursor: 0,
             after: inputs.after_date,
             before: inputs.before_date,
@@ -765,7 +755,7 @@ impl App {
     fn ask_delete(&mut self) {
         match self.preview_ready() {
             None => self.start_preview(),
-            Some(run) if run.total == 0 => {
+            Some(run) if run.total() == 0 => {
                 self.notice = Some("The preview found no messages. Change the scope, range, or filters and preview again.".into());
                 self.modal = None;
             }
@@ -804,24 +794,18 @@ impl App {
     }
 
     fn begin_run(&mut self, run: ConfirmedRun, client: DiscordClient) -> anyhow::Result<()> {
-        let log = resume::ResumeLog::open(&run.account_id)?;
-        let stats = Stats::new(run.total, self.config.settings.workers);
-        let (engine, controls) = Engine::new(self.config.settings.clone(), client, stats.clone());
-        if run.already_done > 0 {
+        let (already_done, account) = (run.already_done, run.account_label.clone());
+        let handle = run.start(self.config.settings.clone(), client, None)?;
+        if already_done > 0 {
             self.notice = Some(format!(
                 "Skipped {} message(s) that an earlier run already deleted.",
-                run.already_done
+                already_done
             ));
         }
-        self.account = run.account_label.clone();
-        self.stats = Some(stats);
-        self.controls = Some(controls);
-        tokio::spawn(async move {
-            engine.run(run, move |key| log.record(key)).await;
-        });
+        self.account = account;
         // The run screen draws no modal, so a form must not wait behind it.
         self.modal = None;
-        self.screen = Screen::Running;
+        self.screen = Screen::Running(handle);
         Ok(())
     }
 
@@ -970,18 +954,15 @@ impl App {
                                 .into(),
                         );
                     }
-                    Ok((run, client)) => {
-                        if let Err(error) = self.begin_run(run, client) {
+                    result => {
+                        if let Err(error) =
+                            result.and_then(|(run, client)| self.begin_run(run, client))
+                        {
+                            self.forget_if_rejected(&error);
                             self.error = Some(format!(
                                 "The run did not start: {error} Correct the problem and press d again."
                             ));
                         }
-                    }
-                    Err(error) => {
-                        self.forget_if_rejected(&error);
-                        self.error = Some(format!(
-                            "The run did not start: {error} Correct the problem and press d again."
-                        ));
                     }
                 }
                 if accepted {
@@ -1028,16 +1009,18 @@ impl App {
                 }
             }
         }
-        if self.screen == Screen::Running
-            && let Some(stats) = self.stats.as_ref().filter(|stats| stats.is_finished())
+        if matches!(&self.screen, Screen::Running(run) if run.task.is_finished())
+            && let Screen::Running(run) = std::mem::replace(&mut self.screen, Screen::Workspace)
         {
-            let snapshot = stats.snapshot();
-            self.report = resume::write_report(&self.account, &snapshot, None)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|error| {
-                    format!("Report failed: {error}. Check directory permissions.")
-                });
-            self.screen = Screen::Done;
+            let report = match run.task.await {
+                Ok(Ok(path)) => path.display().to_string(),
+                Ok(Err(error)) => format!("Report failed: {error}. Check directory permissions."),
+                Err(error) => format!("The run stopped: {error}. Run the app again to retry."),
+            };
+            self.screen = Screen::Done {
+                controls: run.controls,
+                report,
+            };
         }
     }
 
@@ -1056,18 +1039,16 @@ impl App {
     }
 
     pub fn key(&mut self, code: KeyCode) {
-        match self.screen {
-            Screen::Running => {
-                if let Some(c) = &self.controls {
-                    match code {
-                        KeyCode::Char('p' | ' ') => c.toggle_pause(),
-                        KeyCode::Char('s' | 'q') | KeyCode::Esc => c.stop(),
-                        _ => {}
-                    }
+        match &self.screen {
+            Screen::Running(run) => {
+                match code {
+                    KeyCode::Char('p' | ' ') => run.controls.toggle_pause(),
+                    KeyCode::Char('s' | 'q') | KeyCode::Esc => run.controls.stop(),
+                    _ => {}
                 }
                 return;
             }
-            Screen::Done => {
+            Screen::Done { .. } => {
                 match code {
                     KeyCode::Enter => {
                         // Deleted messages are gone, so start from fresh history
@@ -1077,8 +1058,6 @@ impl App {
                         self.range = Range::All;
                         self.preview = None;
                         self.focus = Focus::Where;
-                        self.stats = None;
-                        self.controls = None;
                         self.changed();
                     }
                     KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
@@ -1465,7 +1444,7 @@ impl App {
                 form.type_cursor = form.type_cursor.saturating_sub(1)
             }
             KeyCode::Right if form.field == FilterField::Types => {
-                form.type_cursor = (form.type_cursor + 1).min(TYPES.len() - 1)
+                form.type_cursor = (form.type_cursor + 1).min(TYPE_NAMES.len() - 1)
             }
             KeyCode::Char(' ') if form.field == FilterField::Types => {
                 form.types[form.type_cursor] = !form.types[form.type_cursor]
@@ -1485,7 +1464,7 @@ impl App {
     }
 
     fn apply_filters(&mut self, form: &FilterForm) -> anyhow::Result<()> {
-        let types: Vec<&str> = TYPES
+        let types: Vec<&str> = TYPE_NAMES
             .iter()
             .zip(form.types)
             .filter(|(_, on)| *on)
@@ -1581,10 +1560,10 @@ mod tests {
         app.key(KeyCode::Char(' '));
         app.key(KeyCode::Char('p'));
         settle(&mut app).await;
-        assert_eq!(app.preview_ready().unwrap().total, 50);
+        assert_eq!(app.preview_ready().unwrap().total(), 50);
         assert!(matches!(app.modal, Some(Modal::Preview { .. })));
         app.key(KeyCode::Esc);
-        assert!(app.modal.is_none() && app.stats.is_none());
+        assert!(app.modal.is_none() && matches!(app.screen, Screen::Workspace));
 
         // Marked messages across a server channel and a DM.
         cursor_to(&mut app, Row::Server(0));
@@ -1608,7 +1587,7 @@ mod tests {
         app.key(KeyCode::Char('d'));
         settle(&mut app).await;
         let run = app.preview_ready().unwrap();
-        assert_eq!(run.total, 3);
+        assert_eq!(run.total(), 3);
         assert_eq!(run.jobs.len(), 2);
 
         // Delete needs a token, then y. Any other key cancels.
@@ -1624,7 +1603,9 @@ mod tests {
         app.key(KeyCode::Enter);
         assert!(matches!(app.modal, Some(Modal::Confirm)));
         app.key(KeyCode::Char('n'));
-        assert!(app.modal.is_none() && app.stats.is_none() && app.job.is_none());
+        assert!(
+            app.modal.is_none() && matches!(app.screen, Screen::Workspace) && app.job.is_none()
+        );
 
         // Older than a boundary, in the DM history that is still open.
         assert_eq!(app.focus, Focus::Messages);
@@ -1638,14 +1619,14 @@ mod tests {
         app.key(KeyCode::Char('p'));
         settle(&mut app).await;
         let run = app.preview_ready().unwrap();
-        assert!(run.total > 0);
+        assert!(run.total() > 0);
         assert!(
             run.jobs
                 .iter()
-                .flat_map(|channel_index| &channel_index.items)
+                .flat_map(|job| &job.items)
                 .all(|&message| message < boundary)
         );
-        assert!(app.stats.is_none());
+        assert!(matches!(app.screen, Screen::Workspace));
     }
 
     #[tokio::test]
@@ -1709,7 +1690,6 @@ mod tests {
             account_id: "unknown".into(),
             account_label: String::new(),
             jobs: Vec::new(),
-            total: 0,
             complete: true,
         }
         .confirm(&client)
@@ -1729,8 +1709,7 @@ mod tests {
             revision,
             result: confirmed_result().await,
         });
-        assert_eq!(app.screen, Screen::Workspace);
-        assert!(app.stats.is_none());
+        assert!(matches!(app.screen, Screen::Workspace));
         assert!(
             app.notice
                 .as_deref()

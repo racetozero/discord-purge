@@ -12,6 +12,7 @@ base64.workspace = true
 chrono.workspace = true
 csv.workspace = true
 dirs.workspace = true
+flate2.workspace = true
 iana-time-zone.workspace = true
 rand.workspace = true
 regex.workspace = true
@@ -24,3 +25,7 @@ zip.workspace = true
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true
+
+# flate2 is listed only to select its zlib-rs backend for zip.
+[package.metadata.cargo-shear]
+ignored = ["flate2"]
