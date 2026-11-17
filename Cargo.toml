@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/racetozero/discord-purge"
@@ -24,9 +24,9 @@ csv = "1"
 dirs = "5"
 # The zlib-rs backend inflates package ZIP files faster than miniz_oxide.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-discord-purge-core = { path = "crates/discord-purge-core", version = "0.0.3" }
-discord-purge-tui = { path = "crates/discord-purge-tui", version = "0.0.3" }
-discord-purge-web = { path = "crates/discord-purge-web", version = "0.0.3" }
+discord-purge-core = { path = "crates/discord-purge-core", version = "0.0.4" }
+discord-purge-tui = { path = "crates/discord-purge-tui", version = "0.0.4" }
+discord-purge-web = { path = "crates/discord-purge-web", version = "0.0.4" }
 futures = "0.3"
 iana-time-zone = "0.1"
 open = "5"

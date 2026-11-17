@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.4 - 2026-11-17
+
 ### Changed
 
 - The terminal UI has a new design. The Plan is one sentence with the preview
