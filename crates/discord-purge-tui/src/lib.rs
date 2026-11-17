@@ -1,6 +1,8 @@
 //! Terminal workspace for the shared engine: select where and which messages,
 //! preview the exact set, confirm, and watch the run.
 mod app;
+mod input;
+mod keys;
 mod ui;
 
 use std::time::Duration;
@@ -61,7 +63,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> a
                             _ => app.should_quit = true,
                         }
                     } else if !small {
-                        app.key(key.code);
+                        app.key(key);
                     }
                 }
                 Some(Err(error)) => return Err(error.into()),

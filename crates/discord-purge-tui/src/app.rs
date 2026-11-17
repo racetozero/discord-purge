@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use discord_purge_core::api::{
     BrowseMessage, Channel, DiscordClient, TokenRejected, is_deletable_type,
 };
@@ -18,7 +18,14 @@ use discord_purge_core::selection::{self, Catalog, MessageRange, MessageRef, Sel
 use discord_purge_core::{ConfirmedRun, Options, PreparedRun, RunHandle, Source, prepare};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::input::{TextInput, clean_path};
+use crate::keys::{self, Action, Binding, Ctx};
+
 const JOB_BUSY: &str = "A preview or start check is running. Wait, or press Esc to cancel it.";
+/// Ticks that a notice stays on the status line: about six seconds.
+const NOTICE_TICKS: usize = 50;
+/// Rate samples kept for the run sparkline: one each second.
+const RATE_SAMPLES: usize = 240;
 
 pub(crate) struct Server {
     pub id: String,
@@ -92,8 +99,8 @@ pub(crate) enum SourceField {
 
 pub(crate) struct SourceForm {
     pub package_mode: bool,
-    pub token: String,
-    pub package: String,
+    pub token: TextInput,
+    pub package: TextInput,
     pub field: SourceField,
     /// Asked for a token to delete an offline preview; keep the lists.
     pub for_delete: bool,
@@ -111,7 +118,7 @@ impl SourceForm {
         }
     }
 
-    fn text_field(&mut self) -> Option<&mut String> {
+    fn text_field(&mut self) -> Option<&mut TextInput> {
         match self.field {
             SourceField::Kind => None,
             SourceField::Token => Some(&mut self.token),
@@ -154,20 +161,62 @@ fn step_field<T: Copy + PartialEq>(order: &[T], field: T, code: KeyCode) -> T {
 
 pub(crate) struct FilterForm {
     pub field: FilterField,
-    pub content: String,
+    pub content: TextInput,
     pub types: [bool; 7],
     pub type_cursor: usize,
-    pub after: String,
-    pub before: String,
+    pub after: TextInput,
+    pub before: TextInput,
     pub pinned: bool,
-    pub workers: String,
-    pub delay: String,
-    pub jitter: String,
-    pub error: Option<String>,
+    pub workers: TextInput,
+    pub delay: TextInput,
+    pub jitter: TextInput,
 }
 
 impl FilterForm {
-    fn text_field(&mut self) -> Option<&mut String> {
+    /// The filter and speed that the form holds, or why they are not valid.
+    /// The form calls this as the user types, so an error shows at once.
+    pub fn parse(&self) -> anyhow::Result<(Filter, EngineConfig)> {
+        let types: Vec<&str> = TYPE_NAMES
+            .iter()
+            .zip(self.types)
+            .filter(|(_, on)| *on)
+            .map(|(t, _)| *t)
+            .collect();
+        let filter = Filter::default().with_inputs(
+            Some(&self.content.text),
+            Some(&types.join(",")),
+            Some(self.after.text.trim()),
+            Some(self.before.text.trim()),
+        )?;
+        let number = |name: &str, value: &str, accepted: &str| {
+            value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| anyhow::anyhow!("You entered {value:?} for {name}. Use {accepted}."))
+        };
+        let workers = self.workers.text.trim().parse::<usize>().map_err(|_| {
+            anyhow::anyhow!(
+                "You entered {:?} for workers. Use a whole number from 1 to 16.",
+                self.workers.text
+            )
+        })?;
+        let settings = EngineConfig::new(
+            workers,
+            number(
+                "delay",
+                &self.delay.text,
+                "seconds from 0 to 3600, such as 1.1",
+            )?,
+            number(
+                "jitter",
+                &self.jitter.text,
+                "a fraction from 0 to 1, such as 0.4",
+            )?,
+        )?;
+        Ok((filter, settings))
+    }
+
+    fn text_field(&mut self) -> Option<&mut TextInput> {
         match self.field {
             FilterField::Content => Some(&mut self.content),
             FilterField::After => Some(&mut self.after),
@@ -188,11 +237,16 @@ pub(crate) enum Modal {
     },
     Confirm,
     Link {
-        input: String,
+        input: TextInput,
         error: Option<String>,
     },
     LinkRange(MessageRef),
     Help,
+    /// Run any action by name.
+    Palette {
+        input: TextInput,
+        cursor: usize,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -254,17 +308,6 @@ pub(crate) fn parse_link(input: &str) -> anyhow::Result<Link> {
     })
 }
 
-fn edit(text: &mut String, code: KeyCode) -> bool {
-    match code {
-        KeyCode::Char(c) if !c.is_control() => text.push(c),
-        KeyCode::Backspace => {
-            text.pop();
-        }
-        _ => return false,
-    }
-    true
-}
-
 pub(crate) fn move_cursor(cursor: &mut usize, last: usize, code: KeyCode) -> bool {
     *cursor = match code {
         KeyCode::Up => cursor.saturating_sub(1),
@@ -276,6 +319,15 @@ pub(crate) fn move_cursor(cursor: &mut usize, last: usize, code: KeyCode) -> boo
         _ => return false,
     };
     true
+}
+
+/// The arrow key for a Vim-style key, so j and k move like Down and Up.
+fn motion(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char('j') => KeyCode::Down,
+        KeyCode::Char('k') => KeyCode::Up,
+        code => code,
+    }
 }
 
 pub(crate) fn message_ref(message: &BrowseMessage) -> MessageRef {
@@ -326,7 +378,7 @@ pub(crate) struct App {
     pub account_id: String,
     pub servers: Vec<Server>,
     pub dms: Vec<Dm>,
-    pub query: String,
+    pub query: TextInput,
     pub typing_query: bool,
     pub cursor: usize,
     pub focus: Focus,
@@ -336,9 +388,17 @@ pub(crate) struct App {
     pub preview: Option<(PreparedRun, u64)>,
     pub modal: Option<Modal>,
     pub screen: Screen,
+    /// A short success or info line. It goes away after a few seconds.
     pub notice: Option<String>,
+    /// The notice as the last tick saw it, and that tick, so it can expire.
+    notice_seen: (Option<String>, usize),
+    /// A problem. It stays until the next action or Esc.
     pub error: Option<String>,
     pub activity: String,
+    /// Messages deleted in each second of the run, for the rate chart.
+    pub rates: Vec<u64>,
+    /// The deleted count at the last rate sample.
+    last_deleted: i64,
     loads: JoinSet<Loaded>,
     job: Option<JoinHandle<Loaded>>,
     pub should_quit: bool,
@@ -365,7 +425,7 @@ impl App {
             account_id: String::new(),
             servers: Vec::new(),
             dms: Vec::new(),
-            query: String::new(),
+            query: TextInput::default(),
             typing_query: false,
             cursor: 0,
             focus: Focus::Where,
@@ -376,8 +436,11 @@ impl App {
             modal: None,
             screen: Screen::Workspace,
             notice: None,
+            notice_seen: (None, 0),
             error: None,
             activity: String::new(),
+            rates: Vec::new(),
+            last_deleted: 0,
             loads: JoinSet::new(),
             job: None,
             should_quit: false,
@@ -395,6 +458,11 @@ impl App {
 
     pub fn busy(&self) -> bool {
         !self.loads.is_empty() || self.job.is_some()
+    }
+
+    /// Whether a preview or a start check runs now.
+    pub fn job_running(&self) -> bool {
+        self.job.is_some()
     }
 
     pub fn preview_ready(&self) -> Option<&PreparedRun> {
@@ -423,12 +491,13 @@ impl App {
     fn open_source(&mut self, for_delete: bool) {
         self.modal = Some(Modal::Source(SourceForm {
             package_mode: self.package.is_some() && !for_delete,
-            token: String::new(),
-            package: self
-                .package
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+            token: TextInput::default(),
+            package: TextInput::new(
+                self.package
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
             field: if for_delete || self.package.is_none() {
                 SourceField::Token
             } else {
@@ -444,16 +513,15 @@ impl App {
         let settings = &self.config.settings;
         self.modal = Some(Modal::Filters(FilterForm {
             field: FilterField::Content,
-            content: inputs.content,
+            content: TextInput::new(inputs.content),
             types: TYPE_NAMES.map(|name| self.config.filter.types.contains(type_mask(name))),
             type_cursor: 0,
-            after: inputs.after_date,
-            before: inputs.before_date,
+            after: TextInput::new(inputs.after_date),
+            before: TextInput::new(inputs.before_date),
             pinned: self.config.include_pinned,
-            workers: settings.workers.to_string(),
-            delay: settings.delay.as_secs_f64().to_string(),
-            jitter: settings.jitter.to_string(),
-            error: None,
+            workers: TextInput::new(settings.workers.to_string()),
+            delay: TextInput::new(settings.delay.as_secs_f64().to_string()),
+            jitter: TextInput::new(settings.jitter.to_string()),
         }));
     }
 
@@ -624,7 +692,7 @@ impl App {
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        let query = self.query.to_lowercase();
+        let query = self.query.text.to_lowercase();
         let hit = |s: &str| query.is_empty() || s.to_lowercase().contains(&query);
         let mut rows = vec![Row::ServersHeader];
         for (index, server) in self.servers.iter().enumerate() {
@@ -803,6 +871,8 @@ impl App {
             ));
         }
         self.account = account;
+        self.rates.clear();
+        self.last_deleted = 0;
         // The run screen draws no modal, so a form must not wait behind it.
         self.modal = None;
         self.screen = Screen::Running(handle);
@@ -991,6 +1061,25 @@ impl App {
 
     pub async fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        // A notice on the run or its summary stays, so the summary keeps it.
+        if self.notice != self.notice_seen.0 {
+            self.notice_seen = (self.notice.clone(), self.frame);
+        } else if self.notice.is_some()
+            && matches!(self.screen, Screen::Workspace)
+            && self.frame.wrapping_sub(self.notice_seen.1) > NOTICE_TICKS
+        {
+            self.notice = None;
+        }
+        if let Screen::Running(run) = &self.screen
+            && self.frame.is_multiple_of(8)
+        {
+            let deleted = run.controls.stats().snapshot().deleted;
+            self.rates
+                .push(deleted.saturating_sub(self.last_deleted).max(0) as u64);
+            self.last_deleted = deleted;
+            let extra = self.rates.len().saturating_sub(RATE_SAMPLES);
+            self.rates.drain(..extra);
+        }
         while let Some(result) = self.loads.try_join_next() {
             match result {
                 Ok(loaded) => self.apply(loaded),
@@ -1025,32 +1114,68 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let mut text: String = text.chars().filter(|c| !c.is_control()).collect();
         let field = match &mut self.modal {
-            Some(Modal::Source(form)) => form.text_field(),
-            Some(Modal::Link { input, .. }) => Some(input),
+            Some(Modal::Source(form)) => {
+                if form.field == SourceField::Package {
+                    text = clean_path(&text);
+                    form.package_mode = true;
+                }
+                form.text_field()
+            }
+            Some(Modal::Link { input, .. }) | Some(Modal::Palette { input, .. }) => Some(input),
             Some(Modal::Filters(form)) => form.text_field(),
             None if self.typing_query => Some(&mut self.query),
             _ => None,
         };
         if let Some(field) = field {
-            field.push_str(&text);
+            field.insert(&text);
         }
     }
 
-    pub fn key(&mut self, code: KeyCode) {
+    /// The context of the focused pane, then the workspace.
+    pub fn contexts(&self) -> [Ctx; 2] {
+        match self.focus {
+            Focus::Where => [Ctx::Where, Ctx::Workspace],
+            Focus::Messages => [Ctx::Messages, Ctx::Workspace],
+        }
+    }
+
+    /// The actions that the palette offers for `query`. Each word of the query
+    /// must be in the description or the short label.
+    pub fn palette_items(&self, query: &str) -> Vec<&'static Binding> {
+        let ctxs = self.contexts();
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let mut items: Vec<&'static Binding> = keys::BINDINGS
+            .iter()
+            .filter(|b| {
+                ctxs.contains(&b.ctx) && !matches!(b.action, Action::Move | Action::Palette)
+            })
+            .filter(|b| {
+                let text = format!("{} {}", b.short, b.long).to_lowercase();
+                words.iter().all(|word| text.contains(word.as_str()))
+            })
+            .collect();
+        // Actions whose short label starts with the query come first.
+        let first = words.first().map(String::as_str).unwrap_or_default();
+        items.sort_by_key(|b| !b.short.starts_with(first));
+        items
+    }
+
+    pub fn key(&mut self, event: impl Into<KeyEvent>) {
+        let event: KeyEvent = event.into();
         match &self.screen {
             Screen::Running(run) => {
-                match code {
-                    KeyCode::Char('p' | ' ') => run.controls.toggle_pause(),
-                    KeyCode::Char('s' | 'q') | KeyCode::Esc => run.controls.stop(),
+                match keys::lookup(&[Ctx::Run], event) {
+                    Some(Action::PauseResume) => run.controls.toggle_pause(),
+                    Some(Action::Stop) => run.controls.stop(),
                     _ => {}
                 }
                 return;
             }
             Screen::Done { .. } => {
-                match code {
-                    KeyCode::Enter => {
+                match keys::lookup(&[Ctx::Done], event) {
+                    Some(Action::NewSelection) => {
                         // Deleted messages are gone, so start from fresh history
                         // and a range that names no deleted message.
                         self.screen = Screen::Workspace;
@@ -1060,81 +1185,115 @@ impl App {
                         self.focus = Focus::Where;
                         self.changed();
                     }
-                    KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+                    Some(Action::Quit) => self.should_quit = true,
                     _ => {}
                 }
                 return;
             }
             Screen::Workspace => {}
         }
-        self.error = None;
-        self.notice = None;
         if self.modal.is_some() {
-            self.modal_key(code);
+            self.error = None;
+            self.notice = None;
+            self.modal_key(event);
             return;
         }
         if self.typing_query {
-            match code {
+            match event.code {
                 KeyCode::Esc => {
                     self.typing_query = false;
                     self.query.clear();
                 }
                 KeyCode::Enter | KeyCode::Down => self.typing_query = false,
-                code => {
-                    edit(&mut self.query, code);
-                    self.cursor = 0;
+                _ => {
+                    let before = self.query.text.clone();
+                    self.query.handle(event);
+                    if self.query.text != before {
+                        self.cursor = 0;
+                    }
                 }
             }
             return;
         }
-        match code {
-            KeyCode::Esc if self.job.is_some() => {
-                if let Some(job) = self.job.take() {
-                    job.abort();
-                }
+        // Esc undoes the newest thing first: a running job, then an error.
+        if event.code == KeyCode::Esc {
+            if let Some(job) = self.job.take() {
+                job.abort();
+                self.error = None;
                 self.notice = Some("Cancelled. Nothing was deleted.".into());
+                return;
             }
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.modal = Some(Modal::Help),
-            KeyCode::Char('s') => self.open_source(false),
-            KeyCode::Char('f') => self.open_filters(),
-            KeyCode::Char('l') => {
+            if self.error.take().is_some() {
+                return;
+            }
+        }
+        match keys::lookup(&self.contexts(), event) {
+            Some(action) => self.act(action, event.code),
+            None if event.code == KeyCode::Esc && self.focus == Focus::Where => self.query.clear(),
+            None => {}
+        }
+    }
+
+    /// Do `action`. `code` is the key that asked for it, for actions such as
+    /// Move and Open that use the key.
+    fn act(&mut self, action: Action, code: KeyCode) {
+        // Moving keeps the status line; any other action replaces it.
+        if action != Action::Move {
+            self.error = None;
+            self.notice = None;
+        }
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::Help => self.modal = Some(Modal::Help),
+            Action::Palette => {
+                self.modal = Some(Modal::Palette {
+                    input: TextInput::default(),
+                    cursor: 0,
+                })
+            }
+            Action::Source => self.open_source(false),
+            Action::Filters => self.open_filters(),
+            Action::Link => {
                 self.modal = Some(Modal::Link {
-                    input: String::new(),
+                    input: TextInput::default(),
                     error: None,
                 })
             }
-            KeyCode::Char('r') => self.load_catalog(),
-            KeyCode::Char('p') => self.start_preview(),
-            KeyCode::Char('d') => self.ask_delete(),
-            KeyCode::Tab | KeyCode::BackTab => {
+            Action::Reload => self.load_catalog(),
+            Action::Preview => self.start_preview(),
+            Action::Delete => self.ask_delete(),
+            Action::SwitchPane => {
                 self.focus = match self.focus {
                     Focus::Where if self.history.is_some() => Focus::Messages,
                     _ => Focus::Where,
                 }
             }
-            code => match self.focus {
-                Focus::Where => self.where_key(code),
-                Focus::Messages => self.messages_key(code),
+            Action::Find => {
+                self.focus = Focus::Where;
+                self.typing_query = true;
+            }
+            Action::PauseResume | Action::Stop | Action::NewSelection => {}
+            action => match self.focus {
+                Focus::Where => self.where_act(action, motion(code)),
+                Focus::Messages => self.messages_act(action, motion(code)),
             },
         }
     }
 
-    fn where_key(&mut self, code: KeyCode) {
+    fn where_act(&mut self, action: Action, code: KeyCode) {
         let rows = self.rows();
         self.cursor = self.cursor.min(rows.len() - 1);
-        if move_cursor(&mut self.cursor, rows.len() - 1, code) {
+        if action == Action::Move {
+            move_cursor(&mut self.cursor, rows.len() - 1, code);
             return;
         }
         let row = rows[self.cursor];
-        match (code, row) {
-            (KeyCode::Char('/'), _) => self.typing_query = true,
-            (KeyCode::Esc, _) if !self.query.is_empty() => self.query.clear(),
-            (KeyCode::Char(' '), _) => {
+        match (action, row) {
+            (Action::Select, _) => {
                 self.toggle(row, &rows);
                 self.changed();
             }
-            (KeyCode::Right | KeyCode::Enter, Row::Server(index)) => {
+            (Action::Open, Row::Server(index)) => {
                 if code == KeyCode::Enter && self.servers[index].expanded {
                     self.servers[index].expanded = false;
                 } else {
@@ -1142,7 +1301,7 @@ impl App {
                     self.load_channels(index);
                 }
             }
-            (KeyCode::Right | KeyCode::Enter, Row::Channel(index, channel_index)) => {
+            (Action::Open, Row::Channel(index, channel_index)) => {
                 let channel = self.servers[index]
                     .channels
                     .as_deref()
@@ -1152,12 +1311,12 @@ impl App {
                     self.open_history(channel);
                 }
             }
-            (KeyCode::Right | KeyCode::Enter, Row::Dm(index)) => {
+            (Action::Open, Row::Dm(index)) => {
                 let channel = self.dms[index].channel.clone();
                 self.open_history(channel);
             }
-            (KeyCode::Left, Row::Server(index)) => self.servers[index].expanded = false,
-            (KeyCode::Left, Row::Channel(index, _)) => {
+            (Action::Back, Row::Server(index)) => self.servers[index].expanded = false,
+            (Action::Back, Row::Channel(index, _)) => {
                 self.cursor = rows
                     .iter()
                     .position(|r| *r == Row::Server(index))
@@ -1217,33 +1376,36 @@ impl App {
         }
     }
 
-    fn messages_key(&mut self, code: KeyCode) {
+    fn messages_act(&mut self, action: Action, code: KeyCode) {
         let Some(history) = &mut self.history else {
             self.focus = Focus::Where;
             return;
         };
-        if code == KeyCode::Enter && matches!(history.load, HistoryLoad::Failed(_)) {
-            self.load_messages(false);
+        if action == Action::Open {
+            if matches!(history.load, HistoryLoad::Failed(_)) {
+                self.load_messages(false);
+            }
             return;
         }
         let last = history.messages.len().saturating_sub(1);
-        if code == KeyCode::Down && history.cursor == last && history.more {
-            self.load_messages(true);
-            return;
-        }
-        if move_cursor(&mut history.cursor, last, code) {
+        if action == Action::Move {
+            if code == KeyCode::Down && history.cursor == last && history.more {
+                self.load_messages(true);
+            } else {
+                move_cursor(&mut history.cursor, last, code);
+            }
             return;
         }
         let channel = history.channel.clone();
         let message = history.messages.get(history.cursor).cloned();
-        match (code, message) {
-            (KeyCode::Left | KeyCode::Esc, _) => self.focus = Focus::Where,
-            (KeyCode::Char('c'), _) => {
+        match (action, message) {
+            (Action::Back, _) => self.focus = Focus::Where,
+            (Action::ClearRange, _) => {
                 self.range = Range::All;
                 self.changed();
                 self.notice = Some("Range cleared: all your messages in the scope.".into());
             }
-            (KeyCode::Char(' '), Some(m)) => {
+            (Action::Mark, Some(m)) => {
                 if !self.own(&m) {
                     self.error = Some("You can mark only your own messages. To mark pinned messages, turn on pinned messages in Filters (f).".into());
                     return;
@@ -1263,24 +1425,24 @@ impl App {
                     h.cursor = (h.cursor + 1).min(h.messages.len().saturating_sub(1));
                 }
             }
-            (KeyCode::Char('o'), Some(m)) => {
-                self.set_range(Range::Older(message_ref(&m)), &channel)
-            }
-            (KeyCode::Char('n'), Some(m)) => {
-                self.set_range(Range::Newer(message_ref(&m)), &channel)
-            }
+            (Action::Older, Some(m)) => self.set_range(Range::Older(message_ref(&m)), &channel),
+            (Action::Newer, Some(m)) => self.set_range(Range::Newer(message_ref(&m)), &channel),
             _ => {}
         }
     }
 
-    fn modal_key(&mut self, code: KeyCode) {
+    fn modal_key(&mut self, event: KeyEvent) {
         let Some(modal) = self.modal.take() else {
             return;
         };
+        let code = event.code;
+        let plain = !event
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         self.modal = match modal {
             Modal::Help => None,
             Modal::Confirm => {
-                if code == KeyCode::Char('y') {
+                if plain && code == KeyCode::Char('y') {
                     self.start_run();
                 } else {
                     self.notice = Some("Deletion cancelled. Nothing was deleted.".into());
@@ -1300,8 +1462,36 @@ impl App {
                         self.start_preview();
                         None
                     }
-                    code if move_cursor(&mut cursor, last, code) => Some(Modal::Preview { cursor }),
+                    code if move_cursor(&mut cursor, last, motion(code)) => {
+                        Some(Modal::Preview { cursor })
+                    }
                     _ => None,
+                }
+            }
+            Modal::Palette {
+                mut input,
+                mut cursor,
+            } => {
+                let count = self.palette_items(&input.text).len();
+                match code {
+                    KeyCode::Esc => None,
+                    KeyCode::Enter => {
+                        if let Some(binding) = self.palette_items(&input.text).get(cursor) {
+                            self.act(binding.action, keys::first_key(binding).code);
+                        }
+                        // The action can open its own form.
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        move_cursor(&mut cursor, count.saturating_sub(1), code);
+                        Some(Modal::Palette { input, cursor })
+                    }
+                    _ => {
+                        if input.handle(event) {
+                            cursor = 0;
+                        }
+                        Some(Modal::Palette { input, cursor })
+                    }
                 }
             }
             Modal::LinkRange(reference) => {
@@ -1332,20 +1522,20 @@ impl App {
             }
             Modal::Link { mut input, error } => match code {
                 KeyCode::Esc => None,
-                KeyCode::Enter => match parse_link(&input) {
+                KeyCode::Enter => match parse_link(&input.text) {
                     Ok(link) => self.apply_link(link),
                     Err(e) => Some(Modal::Link {
                         input,
                         error: Some(e.to_string()),
                     }),
                 },
-                code => {
-                    edit(&mut input, code);
+                _ => {
+                    input.handle(event);
                     Some(Modal::Link { input, error })
                 }
             },
-            Modal::Source(form) => self.source_key(form, code),
-            Modal::Filters(form) => self.filters_key(form, code),
+            Modal::Source(form) => self.source_key(form, event),
+            Modal::Filters(form) => self.filters_key(form, event),
         };
     }
 
@@ -1380,11 +1570,11 @@ impl App {
         })
     }
 
-    fn source_key(&mut self, mut form: SourceForm, code: KeyCode) -> Option<Modal> {
-        match code {
+    fn source_key(&mut self, mut form: SourceForm, event: KeyEvent) -> Option<Modal> {
+        match event.code {
             KeyCode::Esc => return None,
             KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
-                form.field = step_field(form.fields(), form.field, code)
+                form.field = step_field(form.fields(), form.field, event.code)
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if form.field == SourceField::Kind =>
@@ -1393,7 +1583,7 @@ impl App {
             }
             KeyCode::Enter => {
                 // Keep the app's token until this form passes its checks.
-                let token = Some(form.token.trim().to_string())
+                let token = Some(form.token.text.trim().to_string())
                     .filter(|token| !token.is_empty())
                     .or_else(|| self.token.clone());
                 if form.for_delete {
@@ -1405,11 +1595,11 @@ impl App {
                     return Some(Modal::Confirm);
                 }
                 if form.package_mode {
-                    let path = PathBuf::from(form.package.trim());
-                    if form.package.trim().is_empty() || !path.exists() {
+                    let typed = form.package.text.trim();
+                    let path = PathBuf::from(typed);
+                    if typed.is_empty() || !path.exists() {
                         form.error = Some(format!(
-                            "The package path {:?} does not exist. Enter the path of the Discord data package ZIP or its extracted folder.",
-                            form.package.trim()
+                            "The package path {typed:?} does not exist. Enter the path of the Discord data package ZIP or its extracted folder."
                         ));
                         return Some(Modal::Source(form));
                     }
@@ -1425,20 +1615,24 @@ impl App {
                 self.load_catalog();
                 return None;
             }
-            code => {
+            _ => {
                 if let Some(field) = form.text_field() {
-                    edit(field, code);
+                    field.handle(event);
+                }
+                // A typed path means the user wants the package.
+                if form.field == SourceField::Package && !form.package.is_empty() {
+                    form.package_mode = true;
                 }
             }
         }
         Some(Modal::Source(form))
     }
 
-    fn filters_key(&mut self, mut form: FilterForm, code: KeyCode) -> Option<Modal> {
-        match code {
+    fn filters_key(&mut self, mut form: FilterForm, event: KeyEvent) -> Option<Modal> {
+        match event.code {
             KeyCode::Esc => return None,
             KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
-                form.field = step_field(&FILTER_FIELDS, form.field, code)
+                form.field = step_field(&FILTER_FIELDS, form.field, event.code)
             }
             KeyCode::Left if form.field == FilterField::Types => {
                 form.type_cursor = form.type_cursor.saturating_sub(1)
@@ -1450,13 +1644,15 @@ impl App {
                 form.types[form.type_cursor] = !form.types[form.type_cursor]
             }
             KeyCode::Char(' ') if form.field == FilterField::Pinned => form.pinned = !form.pinned,
-            KeyCode::Enter => match self.apply_filters(&form) {
-                Ok(()) => return None,
-                Err(error) => form.error = Some(error.to_string()),
-            },
-            code => {
+            // An invalid form stays open; the status line shows why.
+            KeyCode::Enter => {
+                if self.apply_filters(&form).is_ok() {
+                    return None;
+                }
+            }
+            _ => {
                 if let Some(field) = form.text_field() {
-                    edit(field, code);
+                    field.handle(event);
                 }
             }
         }
@@ -1464,39 +1660,7 @@ impl App {
     }
 
     fn apply_filters(&mut self, form: &FilterForm) -> anyhow::Result<()> {
-        let types: Vec<&str> = TYPE_NAMES
-            .iter()
-            .zip(form.types)
-            .filter(|(_, on)| *on)
-            .map(|(t, _)| *t)
-            .collect();
-        let filter = Filter::default().with_inputs(
-            Some(&form.content),
-            Some(&types.join(",")),
-            Some(form.after.trim()),
-            Some(form.before.trim()),
-        )?;
-        let number = |name: &str, value: &str, accepted: &str| {
-            value
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| anyhow::anyhow!("You entered {value:?} for {name}. Use {accepted}."))
-        };
-        let workers = form.workers.trim().parse::<usize>().map_err(|_| {
-            anyhow::anyhow!(
-                "You entered {:?} for workers. Use a whole number from 1 to 16.",
-                form.workers
-            )
-        })?;
-        let settings = EngineConfig::new(
-            workers,
-            number("delay", &form.delay, "seconds from 0 to 3600, such as 1.1")?,
-            number(
-                "jitter",
-                &form.jitter,
-                "a fraction from 0 to 1, such as 0.4",
-            )?,
-        )?;
+        let (filter, settings) = form.parse()?;
         self.config.filter = filter;
         self.config.settings = settings;
         self.config.include_pinned = form.pinned;
@@ -1642,7 +1806,7 @@ mod tests {
         let Some(Modal::Filters(form)) = &app.modal else {
             panic!("an invalid date keeps the form open");
         };
-        assert!(form.error.as_deref().unwrap().contains("YYYY-MM-DD"));
+        assert!(form.parse().unwrap_err().to_string().contains("YYYY-MM-DD"));
         app.key(KeyCode::Esc);
         assert!(app.config.filter.after.is_none());
 
@@ -1651,6 +1815,20 @@ mod tests {
         assert_eq!(app.rows(), vec![Row::ServersHeader, Row::DmsHeader]);
         app.key(KeyCode::Esc);
         assert_eq!(app.rows().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_palette_action_opens_its_form() {
+        let mut app = fixture();
+        app.start();
+        settle(&mut app).await;
+        app.key(KeyCode::Char(':'));
+        app.paste("filters");
+        app.key(KeyCode::Enter);
+        assert!(
+            matches!(app.modal, Some(Modal::Filters(_))),
+            "the palette must not close the form that its action opened"
+        );
     }
 
     #[tokio::test]
@@ -1752,7 +1930,7 @@ mod tests {
         let Some(Modal::Filters(form)) = &app.modal else {
             panic!("the preview replaced the open form");
         };
-        assert_eq!(form.content, "typed text");
+        assert_eq!(form.content.text, "typed text");
     }
 
     #[tokio::test]

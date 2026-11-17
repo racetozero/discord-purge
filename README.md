@@ -144,20 +144,29 @@ The terminal UI and the web panel also let you:
 
 ## Delete after review
 
-| Key                   | Action in the terminal UI                           |
-| --------------------- | --------------------------------------------------- |
-| Tab                   | Go between Where and Messages                       |
-| Up/Down, PgUp/PgDn    | Move. Below the last message, load older messages.  |
-| Space                 | Select a server, channel, or DM; mark a message     |
-| Right or Enter / Left | Expand a server or open a channel / go back         |
-| `/`                   | Find by name                                        |
-| `o` / `n` / `c`       | Older than / newer than this message / clear range  |
-| `l`                   | Paste a Discord link or DM channel ID               |
-| `f` / `s` / `r`       | Filters and speed / token or package / reload lists |
-| `p`                   | Preview the exact messages                          |
-| `d`, then `y`         | Open the confirmation, then delete                  |
-| Space / `s`           | Pause or continue / stop, during a run              |
-| `?` / `q`             | All keys / quit                                     |
+| Key                         | Action in the terminal UI                           |
+| --------------------------- | --------------------------------------------------- |
+| Tab                         | Go between Where and Messages                       |
+| Up/Down, `j`/`k`, PgUp/PgDn | Move. Below the last message, load older messages.  |
+| Space                       | Select a server, channel, or DM; mark a message     |
+| Right or Enter / Left       | Expand a server or open a channel / go back         |
+| `/`                         | Find by name, from either pane                      |
+| `o` / `n` / `c`             | Older than / newer than this message / clear range  |
+| `l`                         | Paste a Discord link or DM channel ID               |
+| `f` / `s` / `r`             | Filters and speed / token or package / reload lists |
+| `p`                         | Preview the exact messages                          |
+| `d`, then `y`               | Open the confirmation, then delete                  |
+| `:` or Ctrl-K               | Command palette: find any action by name            |
+| Esc                         | Cancel a preview, close an error, or go back        |
+| Space / `s`                 | Pause or continue / stop, during a run              |
+| `?` / `q`                   | All keys / quit                                     |
+
+Text fields accept Left/Right, Home/End, Ctrl-W (delete a word), and Ctrl-U
+(delete to the start). A package path that you drop from a file manager loses
+its quotes and escapes. The Plan line shows the selection as one sentence and
+the preview count beside it. On a narrow terminal, the app shows one pane at a
+time, and Tab goes between them. Colors follow your terminal theme, and
+`NO_COLOR` turns them off.
 
 The web panel has the same selections, preview, confirmation, pause, and stop.
 A run deletes only the messages in the preview you confirmed. If you change the

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Changed
+
+- The terminal UI has a new design. The Plan is one sentence with the preview
+  count beside it, and errors and notices have their own status line. Messages
+  that a run deletes have a red mark and stay readable. Messages from other
+  users are dim, and the history has day headers.
+- The terminal UI works from 40 columns and 12 rows. A narrow terminal shows
+  one pane at a time.
+- Filters and the source form open beside Where and check the input as you
+  type. With no source, the app shows a welcome screen.
+- The run screen shows a rate chart and a progress bar for each channel. A
+  finished run shows a summary of the four counts and the report path.
+- Colors use the terminal theme, and `NO_COLOR` turns them off.
+
+### Added
+
+- A command palette (`:` or Ctrl-K) finds any action by name.
+- `j` and `k` move like Down and Up.
+- Text fields have a cursor, and accept Ctrl-W and Ctrl-U.
+
 ## 0.0.3 - 2026-11-14
 
 ### Fixed
